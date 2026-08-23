@@ -853,3 +853,118 @@ class TestDailyPnlEndpoint:
         resp = await client.get("/api/daily-pnl?days=7")
         assert resp.status_code == 200
         assert isinstance(resp.json(), list)
+
+
+# ── /api/strategies signal-only stubs max_pnl / min_pnl ─────────────────────
+
+
+async def _seed_signal_only(db, strategy="P3_calibration_bias"):
+    """Insert a signal with no corresponding trade_outcome (risk-rejected)."""
+    now = datetime.now(timezone.utc).isoformat()
+    sig_id = f"sig_only_{strategy[:8]}"
+    await db.execute(
+        "INSERT OR IGNORE INTO markets (id, platform, platform_id, title, status, created_at, updated_at) "
+        "VALUES ('mkt_sigonly', 'polymarket', 'mkt_sigonly', 'SigOnly', 'open', ?, ?)",
+        (now, now),
+    )
+    await db.execute(
+        """INSERT OR IGNORE INTO signals
+           (id, violation_id, strategy, signal_type, market_id_a,
+            model_edge, kelly_fraction, position_size_a, total_capital_at_risk,
+            status, fired_at, updated_at)
+           VALUES (?, NULL, ?, 'calibration', 'mkt_sigonly',
+                   0.07, 0.10, 3.0, 8.0, 'rejected', ?, ?)""",
+        (sig_id, strategy, now, now),
+    )
+    await db.commit()
+
+
+@pytest.mark.asyncio
+class TestStrategiesSignalOnlyStubs:
+    async def test_signal_only_stub_has_max_min_pnl(self, app_and_client):
+        """Signal-only stubs (no trades) must include max_pnl and min_pnl."""
+        _, client, db_path = app_and_client
+        import aiosqlite
+
+        async with aiosqlite.connect(db_path) as file_db:
+            file_db.row_factory = aiosqlite.Row
+            await _seed_signal_only(file_db, strategy="P3_calibration_bias")
+
+        resp = await client.get("/api/strategies?days=30")
+        assert resp.status_code == 200
+        rows = resp.json()
+        stub = next((r for r in rows if r["strategy"] == "P3_calibration_bias"), None)
+        assert stub is not None, "P3_calibration_bias stub not found"
+        assert "max_pnl" in stub, "max_pnl missing from signal-only stub"
+        assert "min_pnl" in stub, "min_pnl missing from signal-only stub"
+        assert stub["max_pnl"] == 0.0
+        assert stub["min_pnl"] == 0.0
+
+
+# ── /api/positions offset pagination ─────────────────────────────────────────
+
+
+async def _seed_position(db, pos_id: str, strategy: str = "P1_cross_market_arb"):
+    """Insert a minimal open position row."""
+    now = datetime.now(timezone.utc).isoformat()
+    sig_id = f"sig_{pos_id}"
+    await db.execute(
+        "INSERT OR IGNORE INTO markets (id, platform, platform_id, title, status, created_at, updated_at) "
+        "VALUES (?, 'polymarket', ?, 'Pos Market', 'open', ?, ?)",
+        (f"mkt_{pos_id}", f"mkt_{pos_id}", now, now),
+    )
+    await db.execute(
+        """INSERT OR IGNORE INTO signals
+           (id, violation_id, strategy, signal_type, market_id_a,
+            model_edge, kelly_fraction, position_size_a, total_capital_at_risk,
+            status, fired_at, updated_at)
+           VALUES (?, NULL, ?, 'arb_pair', ?,
+                   0.05, 0.10, 5.0, 10.0, 'fired', ?, ?)""",
+        (sig_id, strategy, f"mkt_{pos_id}", now, now),
+    )
+    await db.execute(
+        """INSERT OR IGNORE INTO positions
+           (id, signal_id, market_id, strategy, side, entry_price, entry_size,
+            status, opened_at, updated_at)
+           VALUES (?, ?, ?, ?, 'YES', 0.45, 10.0, 'open', ?, ?)""",
+        (pos_id, sig_id, f"mkt_{pos_id}", strategy, now, now),
+    )
+    await db.commit()
+
+
+@pytest.mark.asyncio
+class TestPositionsOffset:
+    async def test_offset_param_accepted(self, app_and_client):
+        _, client, _ = app_and_client
+        resp = await client.get("/api/positions?offset=0")
+        assert resp.status_code == 200
+
+    async def test_offset_skips_rows(self, app_and_client):
+        _, client, db_path = app_and_client
+        import aiosqlite
+
+        async with aiosqlite.connect(db_path) as file_db:
+            file_db.row_factory = aiosqlite.Row
+            await _seed_position(file_db, "pos_a")
+            await _seed_position(file_db, "pos_b")
+            await _seed_position(file_db, "pos_c")
+
+        resp_all = await client.get("/api/positions?limit=10&offset=0")
+        all_rows = resp_all.json()
+        assert len(all_rows) == 3
+
+        resp_offset = await client.get("/api/positions?limit=10&offset=1")
+        offset_rows = resp_offset.json()
+        assert len(offset_rows) == 2
+
+    async def test_offset_beyond_count_returns_empty(self, app_and_client):
+        _, client, db_path = app_and_client
+        import aiosqlite
+
+        async with aiosqlite.connect(db_path) as file_db:
+            file_db.row_factory = aiosqlite.Row
+            await _seed_position(file_db, "pos_x")
+
+        resp = await client.get("/api/positions?offset=999")
+        assert resp.status_code == 200
+        assert resp.json() == []
