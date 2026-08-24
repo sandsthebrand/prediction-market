@@ -208,7 +208,7 @@ async def _check_unbalanced_arb_pairs(db: aiosqlite.Connection) -> int:
         WHERE o.submitted_at > ?
         GROUP BY o.signal_id
         HAVING filled_count = 1
-          AND o.signal_id NOT IN (SELECT signal_id FROM positions WHERE signal_id IS NOT NULL)
+          AND NOT EXISTS (SELECT 1 FROM positions p WHERE p.signal_id = o.signal_id)
         """,
         (cutoff_30d_str, cutoff_30d_str),
     )

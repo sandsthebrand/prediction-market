@@ -707,17 +707,18 @@ def _build_app(static_dir: str | None = None) -> FastAPI:
             rows = await cursor.fetchall()
             return [
                 {
-                    "date": dict(r)["trade_date"],
-                    "trade_count": dict(r)["trade_count"],
-                    "gross_pnl": round(dict(r)["gross_pnl"], 4),
-                    "total_fees": round(dict(r)["total_fees"], 4),
-                    "net_pnl": round(dict(r)["net_pnl"], 4),
-                    "win_count": dict(r)["win_count"],
-                    "win_rate": round(
-                        dict(r)["win_count"] / dict(r)["trade_count"], 4
-                    ) if dict(r)["trade_count"] > 0 else 0.0,
+                    "date": d["trade_date"],
+                    "trade_count": d["trade_count"],
+                    "gross_pnl": round(d["gross_pnl"], 4),
+                    "total_fees": round(d["total_fees"], 4),
+                    "net_pnl": round(d["net_pnl"], 4),
+                    "win_count": d["win_count"],
+                    "win_rate": round(d["win_count"] / d["trade_count"], 4)
+                    if d["trade_count"] > 0
+                    else 0.0,
                 }
                 for r in rows
+                for d in [dict(r)]
             ]
         finally:
             await close_db(db)
