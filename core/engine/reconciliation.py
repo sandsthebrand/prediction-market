@@ -151,7 +151,8 @@ async def _check_stuck_pending_orders(db: aiosqlite.Connection) -> int:
             f"order_id={order_id} signal_id={signal_id} "
             f"market_id={market_id} age_s={age_s}"
         )
-        if await _is_recently_logged(db, "stuck_pending_order", detail):
+        dedup_key = f"order_id={order_id}"
+        if await _is_recently_logged(db, "stuck_pending_order", dedup_key):
             continue
         await _log_discrepancy(
             db,

@@ -624,6 +624,7 @@ def _build_app(static_dir: str | None = None) -> FastAPI:
                 "concentration_pct": round(concentration, 2),
                 "daily_var": round(daily_var, 2),
                 "daily_var_sample_size": len(daily_pnls),
+                "daily_var_reliable": len(daily_pnls) >= 10,
                 "daily_var_confidence_pct": round((1 - _VAR_TAIL_PCT) * 100),
                 "sharpe_overall": round(overall_sharpe, 2),
                 "sharpe_sample_size": len(pnl_values),
