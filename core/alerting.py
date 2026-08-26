@@ -179,6 +179,56 @@ def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
+class SlackWebhookTransport:
+    """
+    Post alerts to a Slack Incoming Webhook.
+
+    Slack webhook JSON shape:
+        {"text": "..."}
+
+    Note: Slack's Incoming Webhooks API uses ``text`` (not Discord's ``content``
+    or ``embeds``). Sending Discord-shaped payloads to a Slack URL silently
+    drops the message because Slack ignores unknown fields and ``text`` is
+    required.
+    """
+
+    name = "slack"
+
+    def __init__(
+        self,
+        webhook_url: str,
+        timeout_s: float = 5.0,
+    ) -> None:
+        self.webhook_url = webhook_url
+        self.timeout_s = timeout_s
+
+    async def publish(self, alert: Alert) -> bool:
+        severity_label = {
+            Severity.INFO: "INFO",
+            Severity.WARNING: "WARNING",
+            Severity.CRITICAL: "CRITICAL",
+        }.get(alert.severity, alert.severity.value.upper())
+        text = f"[{severity_label}] {alert.title}: {alert.message}"[:4000]
+        payload = {"text": text}
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+                resp = await client.post(self.webhook_url, json=payload)
+                if 200 <= resp.status_code < 300:
+                    return True
+                logger.warning(
+                    "Slack webhook returned %d: %s",
+                    resp.status_code,
+                    resp.text[:200],
+                )
+                return False
+        except httpx.TimeoutException:
+            logger.warning("Slack webhook timed out after %ss", self.timeout_s)
+            return False
+        except Exception as e:
+            logger.warning("Slack webhook failed: %s", e)
+            return False
+
+
 class AlertManager:
     """
     Central alert dispatcher with dedup and multi-transport fanout.
@@ -344,14 +394,11 @@ def _build_default_manager() -> AlertManager:
         )
         logger.info("Alerting enabled: Discord webhook")
 
-    # Slack uses the same webhook shape — Discord payloads render fine there
-    # as long as you use the "content" field. Enable both if you want cross-post.
     slack_url = os.getenv("ALERT_SLACK_WEBHOOK_URL", "").strip()
     if slack_url:
         transports.append(
-            DiscordWebhookTransport(  # same shape
+            SlackWebhookTransport(
                 webhook_url=slack_url,
-                username=os.getenv("ALERT_BOT_USERNAME", "prediction-market-bot"),
                 timeout_s=float(os.getenv("ALERT_TIMEOUT_S", "5")),
             )
         )
