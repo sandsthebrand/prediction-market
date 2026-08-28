@@ -389,3 +389,39 @@ async def test_reconciliation_skips_balanced_arb_pair(db):
 
     summary = await reconcile_internal_state(db)
     assert summary["unbalanced_arb_pairs"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_stuck_order_dedup_prevents_double_log(db):
+    """Running reconciliation twice for the same stuck order must log it only once.
+
+    The v2.43 fix moved stuck-pending dedup to use order_id as the key so
+    that the time-varying age_s field in the detail string doesn't break the
+    1-hour dedup window.
+    """
+    await _seed_market(db, "mktG", status="open")
+    await _seed_signal(db, "sigG", "mktG")
+    await _seed_order(
+        db,
+        "ordG",
+        signal_id="sigG",
+        market_id="mktG",
+        status="pending",
+        submitted_at=int(time.time()) - 3600,
+    )
+    await db.commit()
+
+    # First run — should log the discrepancy.
+    summary1 = await reconcile_internal_state(db)
+    assert summary1["stuck_pending_orders"] == 1
+
+    # Second run — same order is still stuck; dedup should suppress re-logging.
+    summary2 = await reconcile_internal_state(db)
+    assert summary2["stuck_pending_orders"] == 0
+
+    # Exactly one row in the log for this order.
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM reconciliation_log WHERE check_type='stuck_pending_order'"
+    )
+    row = await cursor.fetchone()
+    assert row[0] == 1, "Dedup should prevent a second log entry for the same stuck order"

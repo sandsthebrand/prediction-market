@@ -27,6 +27,7 @@ from core.alerting import (
     DiscordWebhookTransport,
     NullTransport,
     Severity,
+    SlackWebhookTransport,
     get_alert_manager,
     set_alert_manager,
 )
@@ -353,3 +354,102 @@ async def test_integration_via_asyncmock():
     ok = await mgr.send(title="t", message="m", severity=Severity.INFO)
     assert ok is True
     mock_transport.publish.assert_awaited_once()
+
+
+# ── SlackWebhookTransport ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_slack_transport_sends_text_field(monkeypatch):
+    """SlackWebhookTransport must post a payload with 'text' (not 'content')."""
+    transport = SlackWebhookTransport(webhook_url="https://example.invalid/slack")
+    posted = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = "ok"
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json):
+            posted["url"] = url
+            posted["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr("core.alerting.httpx.AsyncClient", FakeClient)
+
+    alert = Alert(title="Health check", message="All ok", severity=Severity.INFO)
+    ok = await transport.publish(alert)
+    assert ok is True
+    assert "text" in posted["json"], "Slack payload must have 'text' field"
+    assert "embeds" not in posted["json"], "Slack payload must not have Discord 'embeds'"
+    assert "content" not in posted["json"], "Slack payload must not have Discord 'content'"
+    assert "Health check" in posted["json"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_slack_transport_includes_severity_in_text(monkeypatch):
+    """SlackWebhookTransport text must contain severity label."""
+    transport = SlackWebhookTransport(webhook_url="https://example.invalid/slack")
+
+    class FakeResponse:
+        status_code = 200
+        text = "ok"
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json):
+            FakeClient._payload = json
+            return FakeResponse()
+
+    monkeypatch.setattr("core.alerting.httpx.AsyncClient", FakeClient)
+
+    alert = Alert(title="Breaker", message="Tripped", severity=Severity.CRITICAL)
+    await transport.publish(alert)
+    payload_text = FakeClient._payload["text"]
+    assert "CRITICAL" in payload_text
+
+
+@pytest.mark.asyncio
+async def test_slack_transport_http_failure_returns_false(monkeypatch):
+    """A Slack webhook HTTP error must return False, not raise."""
+    transport = SlackWebhookTransport(webhook_url="https://example.invalid/slack")
+
+    class FakeResponse:
+        status_code = 403
+        text = "forbidden"
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json):
+            return FakeResponse()
+
+    monkeypatch.setattr("core.alerting.httpx.AsyncClient", FakeClient)
+
+    alert = Alert(title="t", message="m")
+    ok = await transport.publish(alert)
+    assert ok is False

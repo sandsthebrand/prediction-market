@@ -162,7 +162,8 @@ async def _check_stuck_pending_orders(db: aiosqlite.Connection) -> int:
             exchange_value=None,
             discrepancy=float(age_s),
             status="discrepancy",
-            detail=detail,
+            detail=dedup_key,
+            action_taken=detail,
         )
         count += 1
     return count

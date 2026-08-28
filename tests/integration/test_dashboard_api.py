@@ -325,9 +325,18 @@ class TestRiskEndpoint:
             "concentration_pct",
             "daily_var",
             "daily_var_confidence_pct",
+            "daily_var_reliable",
+            "daily_var_sample_size",
             "sharpe_overall",
         ):
             assert key in data, f"Missing key: {key}"
+
+    async def test_daily_var_reliable_false_on_empty_db(self, app_and_client):
+        _, client, _ = app_and_client
+        resp = await client.get("/api/risk")
+        data = resp.json()
+        assert data["daily_var_reliable"] is False
+        assert data["daily_var_sample_size"] == 0
 
     async def test_var_confidence_pct_is_95(self, app_and_client):
         _, client, _ = app_and_client
@@ -535,6 +544,8 @@ class TestSystemHealthEndpoint:
         assert "reconciliation_discrepancies_24h" in data
         assert "invariant_violations_24h" in data
         assert "daily_loss_pct_used" in data
+        assert "signals_24h" in data
+        assert "signals_24h_by_strategy" in data
 
     async def test_system_health_ok_on_empty_db(self, app_and_client):
         _, client, _ = app_and_client
