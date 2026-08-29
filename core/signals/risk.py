@@ -91,7 +91,6 @@ async def check_position_limit(
 
 
 async def check_daily_loss_limit(
-    signal: Any,
     starting_capital: float,
     max_daily_loss_pct: float,
     db: aiosqlite.Connection | None = None,
@@ -337,7 +336,7 @@ async def run_all_checks(
     raw = await asyncio.gather(
         check_position_limit(signal, portfolio_value, risk_config.max_position_pct, db),
         check_daily_loss_limit(
-            signal, risk_config.starting_capital, risk_config.max_daily_loss_pct, db
+            risk_config.starting_capital, risk_config.max_daily_loss_pct, db
         ),
         check_portfolio_exposure(
             signal, portfolio_value, risk_config.max_portfolio_exposure_pct, db

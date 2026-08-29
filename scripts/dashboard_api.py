@@ -714,9 +714,11 @@ def _build_app(static_dir: str | None = None) -> FastAPI:
                     "total_fees": round(d["total_fees"], 4),
                     "net_pnl": round(d["net_pnl"], 4),
                     "win_count": d["win_count"],
-                    "win_rate": round(d["win_count"] / d["trade_count"], 4)
-                    if d["trade_count"] > 0
-                    else 0.0,
+                    "win_rate": (
+                        round(d["win_count"] / d["trade_count"], 4)
+                        if d["trade_count"] > 0
+                        else 0.0
+                    ),
                 }
                 for r in rows
                 for d in [dict(r)]

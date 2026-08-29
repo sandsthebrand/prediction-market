@@ -147,12 +147,14 @@ async def _check_stuck_pending_orders(db: aiosqlite.Connection) -> int:
             age_s = int(time.time()) - int(submitted_at)
         except (TypeError, ValueError):
             age_s = -1
-        detail = (
+        # detail is the stable per-order key used for _is_recently_logged dedup
+        # (must not include age_s which changes each cycle).
+        detail = f"order_id={order_id}"
+        action_taken = (
             f"order_id={order_id} signal_id={signal_id} "
             f"market_id={market_id} age_s={age_s}"
         )
-        dedup_key = f"order_id={order_id}"
-        if await _is_recently_logged(db, "stuck_pending_order", dedup_key):
+        if await _is_recently_logged(db, "stuck_pending_order", detail):
             continue
         await _log_discrepancy(
             db,
@@ -162,8 +164,8 @@ async def _check_stuck_pending_orders(db: aiosqlite.Connection) -> int:
             exchange_value=None,
             discrepancy=float(age_s),
             status="discrepancy",
-            detail=dedup_key,
-            action_taken=detail,
+            detail=detail,
+            action_taken=action_taken,
         )
         count += 1
     return count
