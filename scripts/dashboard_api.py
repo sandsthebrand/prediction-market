@@ -1184,8 +1184,8 @@ def _build_app(static_dir: str | None = None) -> FastAPI:
                     )
                 else:
                     result["last_snapshot_age_s"] = None
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("health: last_snapshot_age_s query failed: %s", e)
             try:
                 sig_cursor = await db.execute(
                     "SELECT fired_at FROM signals ORDER BY fired_at DESC LIMIT 1"
@@ -1200,8 +1200,8 @@ def _build_app(static_dir: str | None = None) -> FastAPI:
                     )
                 else:
                     result["last_signal_age_s"] = None
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("health: last_signal_age_s query failed: %s", e)
             try:
                 _cutoff_24h = (
                     datetime.now(timezone.utc) - timedelta(hours=24)

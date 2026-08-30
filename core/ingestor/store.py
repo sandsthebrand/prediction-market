@@ -294,8 +294,8 @@ async def store_markets(
                 if isinstance(parsed, list) and len(parsed) >= 2:
                     yes_token_id = str(parsed[0]) if parsed[0] else None
                     no_token_id = str(parsed[1]) if parsed[1] else None
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("clobTokenIds parse failed for %r: %s", raw_tokens, e)
 
         price = None
         last_price_no: float | None = None
@@ -316,8 +316,8 @@ async def store_markets(
                 if op and isinstance(op, str):
                     prices = _json.loads(op)
                     price = float(prices[0]) if prices else None
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("outcomePrices parse failed for %r: %s", op, e)
 
         if not price or price <= 0.01 or price >= 0.99:
             continue

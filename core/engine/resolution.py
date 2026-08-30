@@ -133,8 +133,12 @@ async def close_resolved_positions(db: aiosqlite.Connection) -> dict[str, float]
                         holding_period_ms = int(
                             (now_dt - opened_dt).total_seconds() * 1000
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(
+                            "holding_period_ms parse failed for opened_at=%r: %s",
+                            opened_at,
+                            e,
+                        )
                 try:
                     await db.execute(
                         """INSERT OR IGNORE INTO trade_outcomes

@@ -241,8 +241,12 @@ async def mark_and_close_positions(
                     if opened_dt.tzinfo is None:
                         opened_dt = opened_dt.replace(tzinfo=timezone.utc)
                     holding_period_ms = int((now_dt - opened_dt).total_seconds() * 1000)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(
+                        "holding_period_ms parse failed for opened_at=%r: %s",
+                        opened_at,
+                        e,
+                    )
 
             # Populate edge/spread metrics from pre-fetched signal/violation data.
             violation_id = None
