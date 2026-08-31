@@ -815,7 +815,12 @@ class ArbitrageEngine:
         await self.db.commit()
 
     def stats(self) -> dict:
-        total_pnl = sum(t.get("actual_pnl", 0) for t in self.trades)
+        total_pnl = 0.0
+        total_fees = 0.0
+        for t in self.trades:
+            total_pnl += t.get("actual_pnl", 0)
+            total_fees += t.get("fees", 0)
+        trade_count = len(self.trades)
         now = time.time()
         # Mirror the guards from _try_fire_pair() so pairs_eligible_now reflects
         # how many pairs would actually fire, not just how many have a spread above
@@ -848,6 +853,8 @@ class ArbitrageEngine:
             "last_arb_fired_at": self.last_arb_fired_at,
             "ticks_since_last_fire": self._ticks_since_last_fire,
             "total_pnl": total_pnl,
+            "total_fees": total_fees,
+            "trade_count": trade_count,
             "prices_tracked": len(self.prices),
             "ws_last_tick_age_ms_by_platform": tick_age,
             "skipped_stale": self._skipped_stale,

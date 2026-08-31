@@ -231,8 +231,20 @@ class TestFlushAndStats:
         assert "pairs_eligible_now" in stats
         assert "recently_fired" in stats
         assert "total_pnl" in stats
+        assert "total_fees" in stats
+        assert "trade_count" in stats
         assert "prices_tracked" in stats
         assert stats["prices_tracked"] > 0
+        assert stats["trade_count"] == 0
+        assert stats["total_fees"] == 0.0
+
+    async def test_stats_trade_count_increments_after_trade(self, db, matches):
+        await _seed_markets_for_engine(db, matches)
+        engine = ArbitrageEngine(db, matches, min_spread=0.03)
+        await engine.initial_sweep()
+        stats = engine.stats()
+        assert stats["trade_count"] == len(engine.trades)
+        assert stats["total_fees"] >= 0.0
 
 
 @pytest.mark.asyncio
