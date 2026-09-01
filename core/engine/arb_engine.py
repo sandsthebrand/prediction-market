@@ -48,7 +48,9 @@ class ArbitrageEngine:
         self.db = db
         self.min_spread = min_spread
         self.trades: list[dict] = []
-        self._trade_lock = asyncio.Lock()
+        # Per-pair locks so independent pairs can execute concurrently.
+        # setdefault guarantees safe lazy creation under asyncio (no TOCTOU).
+        self._pair_locks: dict[str, asyncio.Lock] = {}
 
         # Phase 2: risk config and circuit breaker.
         # Phase 6: when execution_mode is provided and risk_config is not, use
@@ -175,6 +177,7 @@ class ArbitrageEngine:
 
         for pair_id in removed:
             self.fired_state.pop(pair_id, None)
+            self._pair_locks.pop(pair_id, None)
 
         # Prune per-market state for markets no longer referenced by any pair.
         # Without this, _market_platform / _last_tick_at / prices grew by ~2
@@ -210,6 +213,15 @@ class ArbitrageEngine:
             "removed": len(removed),
             "retained": len(retained),
         }
+
+    def _get_pair_lock(self, pair_id: str) -> asyncio.Lock:
+        """Return the per-pair lock, creating it on first use.
+
+        setdefault is atomic under asyncio (single-threaded event loop) so
+        two coroutines racing to create the same pair's lock will both call
+        setdefault but only the first insertion wins; no TOCTOU race.
+        """
+        return self._pair_locks.setdefault(pair_id, asyncio.Lock())
 
     def _is_fresh(self, market_id: str, now: float | None = None) -> bool:
         """Return True if ``market_id``'s cached price was updated within
@@ -279,8 +291,9 @@ class ArbitrageEngine:
             self._skipped_stale += 1
             return False
 
-        # Execute under lock to prevent concurrent trades on the same pair.
-        async with self._trade_lock:
+        # Execute under a per-pair lock to prevent concurrent trades on the same
+        # pair while allowing different pairs to execute concurrently.
+        async with self._get_pair_lock(pair_id):
             # Re-read prices under lock: an on_price_update() awaited while we
             # waited for the lock could have moved prices, so snapshot them
             # fresh here to avoid trading on a spread that has already closed.
