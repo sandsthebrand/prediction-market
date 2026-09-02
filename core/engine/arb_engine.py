@@ -289,6 +289,13 @@ class ArbitrageEngine:
             and self._is_fresh(match["kalshi_id"], now)
         ):
             self._skipped_stale += 1
+            stale_poly = not self._is_fresh(match["poly_id"], now)
+            stale_market = match["poly_id"] if stale_poly else match["kalshi_id"]
+            stale_age_ms = int((now - (self._last_tick_at.get(stale_market) or now)) * 1000)
+            logger.debug(
+                "Skipping stale fire pair=%s stale_market=%s tick_age_ms=%d",
+                pair_id, stale_market, stale_age_ms,
+            )
             return False
 
         # Execute under a per-pair lock to prevent concurrent trades on the same
@@ -313,6 +320,14 @@ class ArbitrageEngine:
                 self._is_fresh(match["poly_id"]) and self._is_fresh(match["kalshi_id"])
             ):
                 self._skipped_stale += 1
+                now_inner = time.time()
+                stale_poly_inner = not self._is_fresh(match["poly_id"], now_inner)
+                stale_market_inner = match["poly_id"] if stale_poly_inner else match["kalshi_id"]
+                stale_age_ms_inner = int((now_inner - (self._last_tick_at.get(stale_market_inner) or now_inner)) * 1000)
+                logger.debug(
+                    "Skipping stale fire pair=%s stale_market=%s tick_age_ms=%d",
+                    pair_id, stale_market_inner, stale_age_ms_inner,
+                )
                 return False
             try:
                 trade = await self._execute_arb_trade(
@@ -869,6 +884,11 @@ class ArbitrageEngine:
             "total_fees": total_fees,
             "trade_count": trade_count,
             "prices_tracked": len(self.prices),
+            "stale_prices_count": sum(
+                1
+                for market_id in self._last_tick_at
+                if not self._is_fresh(market_id, now)
+            ),
             "ws_last_tick_age_ms_by_platform": tick_age,
             "skipped_stale": self._skipped_stale,
         }

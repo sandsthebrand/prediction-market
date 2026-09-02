@@ -37,11 +37,13 @@ async def reconcile_internal_state(db: aiosqlite.Connection) -> dict[str, int]:
         "orphaned_positions": 0,
         "stuck_pending_orders": 0,
         "unbalanced_arb_pairs": 0,
+        "closed_without_outcomes": 0,
     }
 
     summary["orphaned_positions"] = await _check_orphaned_positions(db)
     summary["stuck_pending_orders"] = await _check_stuck_pending_orders(db)
     summary["unbalanced_arb_pairs"] = await _check_unbalanced_arb_pairs(db)
+    summary["closed_without_outcomes"] = await _check_closed_without_outcomes(db)
 
     try:
         await db.commit()
@@ -303,3 +305,50 @@ async def _log_discrepancy(
             check_type,
             e,
         )
+
+
+async def _check_closed_without_outcomes(db: aiosqlite.Connection) -> int:
+    """Closed positions with no corresponding trade_outcomes row.
+
+    A position that closes cleanly should always produce a trade_outcomes row.
+    A closed position without one indicates a write ordering failure that
+    silently corrupts PnL accounting and strategy performance metrics.
+
+    Bounded to the last 30 days via updated_at to avoid false positives from
+    legacy positions written before this relationship was enforced.
+    """
+    cutoff_30d = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    cursor = await db.execute(
+        """
+        SELECT p.id, p.signal_id, p.market_id, p.updated_at
+        FROM positions p
+        WHERE p.status = 'closed'
+          AND p.updated_at >= ?
+          AND p.signal_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM trade_outcomes t WHERE t.signal_id = p.signal_id
+          )
+        """,
+        (cutoff_30d,),
+    )
+    rows = await cursor.fetchall()
+    count = 0
+    for pos_id, signal_id, market_id, updated_at in rows:
+        detail = (
+            f"position_id={pos_id} signal_id={signal_id} "
+            f"market_id={market_id} closed_at={updated_at}"
+        )
+        if await _is_recently_logged(db, "closed_without_outcome", detail):
+            continue
+        await _log_discrepancy(
+            db,
+            platform="internal",
+            check_type="closed_without_outcome",
+            local_value=1.0,
+            exchange_value=0.0,
+            discrepancy=1.0,
+            status="discrepancy",
+            detail=detail,
+        )
+        count += 1
+    return count
