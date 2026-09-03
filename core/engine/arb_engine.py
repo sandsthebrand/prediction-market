@@ -291,10 +291,14 @@ class ArbitrageEngine:
             self._skipped_stale += 1
             stale_poly = not self._is_fresh(match["poly_id"], now)
             stale_market = match["poly_id"] if stale_poly else match["kalshi_id"]
-            stale_age_ms = int((now - (self._last_tick_at.get(stale_market) or now)) * 1000)
+            stale_age_ms = int(
+                (now - (self._last_tick_at.get(stale_market) or now)) * 1000
+            )
             logger.debug(
                 "Skipping stale fire pair=%s stale_market=%s tick_age_ms=%d",
-                pair_id, stale_market, stale_age_ms,
+                pair_id,
+                stale_market,
+                stale_age_ms,
             )
             return False
 
@@ -322,11 +326,21 @@ class ArbitrageEngine:
                 self._skipped_stale += 1
                 now_inner = time.time()
                 stale_poly_inner = not self._is_fresh(match["poly_id"], now_inner)
-                stale_market_inner = match["poly_id"] if stale_poly_inner else match["kalshi_id"]
-                stale_age_ms_inner = int((now_inner - (self._last_tick_at.get(stale_market_inner) or now_inner)) * 1000)
+                stale_market_inner = (
+                    match["poly_id"] if stale_poly_inner else match["kalshi_id"]
+                )
+                stale_age_ms_inner = int(
+                    (
+                        now_inner
+                        - (self._last_tick_at.get(stale_market_inner) or now_inner)
+                    )
+                    * 1000
+                )
                 logger.debug(
                     "Skipping stale fire pair=%s stale_market=%s tick_age_ms=%d",
-                    pair_id, stale_market_inner, stale_age_ms_inner,
+                    pair_id,
+                    stale_market_inner,
+                    stale_age_ms_inner,
                 )
                 return False
             try:
@@ -731,6 +745,7 @@ class ArbitrageEngine:
                 return None
 
             pos_id = f"pos_{uuid.uuid4().hex[:12]}"
+            _positions_written = False
             try:
                 await self.db.execute(
                     """INSERT INTO positions
@@ -756,6 +771,7 @@ class ArbitrageEngine:
                         now,
                     ),
                 )
+                _positions_written = True
             except Exception:
                 logger.exception(
                     "Failed to insert positions row for pair=%s signal_id=%s pos_id=%s",
@@ -764,6 +780,7 @@ class ArbitrageEngine:
                     pos_id,
                 )
 
+            _outcomes_written = False
             try:
                 await self.db.execute(
                     """INSERT INTO trade_outcomes
@@ -795,26 +812,39 @@ class ArbitrageEngine:
                         now,
                     ),
                 )
+                _outcomes_written = True
             except Exception:
                 logger.exception(
                     "Failed to insert trade_outcomes row for pair=%s signal_id=%s",
                     pair_id,
                     signal_id,
                 )
+                if _positions_written:
+                    # Roll back the positions row so reconciliation doesn't see
+                    # a closed position with no corresponding trade_outcomes row.
+                    try:
+                        await self.db.rollback()
+                    except Exception:
+                        logger.debug(
+                            "rollback after trade_outcomes failure pair=%s",
+                            pair_id,
+                            exc_info=True,
+                        )
 
             # Commit per trade: batching delayed persistence by up to 9 trades,
             # so a process crash between flushes could drop filled positions
             # that already moved real capital on the exchange. Reconciliation
             # can't repair what it can't see. SQLite in WAL mode handles
             # single-row commits cheaply, so the throughput cost is negligible.
-            try:
-                await self.db.commit()
-            except Exception:
-                logger.exception(
-                    "Failed to commit positions/trade_outcomes for pair=%s signal_id=%s",
-                    pair_id,
-                    signal_id,
-                )
+            if _positions_written and _outcomes_written:
+                try:
+                    await self.db.commit()
+                except Exception:
+                    logger.exception(
+                        "Failed to commit positions/trade_outcomes for pair=%s signal_id=%s",
+                        pair_id,
+                        signal_id,
+                    )
 
             logger.info(
                 "  ARB FILLED: pnl=$%.4f fees=$%.4f | buy@%.4f sell@%.4f",
