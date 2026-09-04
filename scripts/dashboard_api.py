@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import secrets
+import sqlite3
 import statistics
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -43,6 +44,13 @@ def configure(db_path: str) -> None:
     """Set the database path for all endpoints. Call before starting server."""
     global _DB_PATH
     _DB_PATH = db_path
+    # Enable WAL mode once at startup (it's a persistent DB-level setting).
+    # Uses the sync sqlite3 driver so this works in both sync and async contexts.
+    try:
+        with sqlite3.connect(db_path) as _c:
+            _c.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.Error as _e:
+        logger.warning("Could not enable WAL mode on %s: %s", db_path, _e)
 
 
 async def _compute_daily_loss_today(db: aiosqlite.Connection) -> float:
@@ -133,7 +141,6 @@ def _build_app(static_dir: str | None = None) -> FastAPI:
     async def get_db() -> aiosqlite.Connection:
         db = await aiosqlite.connect(_DB_PATH)
         db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA busy_timeout=5000")
         return db
 

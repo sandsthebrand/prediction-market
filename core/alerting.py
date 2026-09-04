@@ -242,9 +242,11 @@ class AlertManager:
         self,
         transports: list[AlertTransport],
         dedup_window_s: float = 300.0,
+        critical_dedup_window_s: float = 10.0,
     ) -> None:
         self.transports = transports
         self.dedup_window_s = dedup_window_s
+        self.critical_dedup_window_s = critical_dedup_window_s
         self._recent: dict[str, float] = {}
         # Strong references to in-flight send_nowait tasks. asyncio only holds
         # a weak reference to scheduled tasks, so without this the garbage
@@ -294,9 +296,8 @@ class AlertManager:
             component=component,
         )
 
-        critical_window = 10.0
         dedup_window = (
-            critical_window
+            self.critical_dedup_window_s
             if alert.severity == Severity.CRITICAL
             else self.dedup_window_s
         )
@@ -409,4 +410,9 @@ def _build_default_manager() -> AlertManager:
         logger.info("Alerting disabled (no webhook configured, using NullTransport)")
 
     dedup_window = float(os.getenv("ALERT_DEDUP_WINDOW_S", "300"))
-    return AlertManager(transports=transports, dedup_window_s=dedup_window)
+    critical_dedup_window = float(os.getenv("ALERT_CRITICAL_DEDUP_WINDOW_S", "10"))
+    return AlertManager(
+        transports=transports,
+        dedup_window_s=dedup_window,
+        critical_dedup_window_s=critical_dedup_window,
+    )

@@ -63,10 +63,7 @@ def compute_position_size(
         max_size: Hard ceiling on position size (default $10k)
 
     Returns:
-        Position size in USD (0 to max_size)
-
-    Raises:
-        ValueError: If bankroll is non-positive
+        Position size in USD (0 to max_size). Returns 0.0 if bankroll is non-positive.
     """
     if bankroll <= 0:
         logger.warning("Bankroll must be positive")
