@@ -199,14 +199,20 @@ class ArbitrageEngine:
         if added:
             self._needs_initial_sweep = True
 
+        # Reset the stale-skip counter so stats() reflects skips since the
+        # most recent pair refresh rather than the lifetime of the engine.
+        prev_skipped = self._skipped_stale
+        self._skipped_stale = 0
+
         logger.info(
             "ArbitrageEngine.update_pairs: added=%d removed=%d retained=%d "
-            "total=%d pruned_markets=%d",
+            "total=%d pruned_markets=%d skipped_stale_reset=%d",
             len(added),
             len(removed),
             len(retained),
             len(self._pairs),
             len(stale_market_ids),
+            prev_skipped,
         )
         return {
             "added": len(added),
