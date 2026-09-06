@@ -296,6 +296,15 @@ class Config:
                 f"STRATEGY_HOLDING_PERIOD_S must be > 0, "
                 f"got {self.risk_controls.strategy_holding_period_s}"
             )
+        if not (0 < self.risk_controls.max_portfolio_exposure_pct <= 1):
+            raise ValueError(
+                f"MAX_PORTFOLIO_EXPOSURE_PCT must be > 0 and <= 1, "
+                f"got {self.risk_controls.max_portfolio_exposure_pct}"
+            )
+        if self.risk_controls.slippage_bps < 0:
+            raise ValueError(
+                f"SLIPPAGE_BPS must be >= 0, got {self.risk_controls.slippage_bps}"
+            )
         if self.risk_controls.arb_cooldown_s < 0:
             raise ValueError(
                 f"ARB_COOLDOWN_S must be >= 0, got {self.risk_controls.arb_cooldown_s}"

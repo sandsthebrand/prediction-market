@@ -301,6 +301,7 @@ def _build_app(static_dir: str | None = None) -> FastAPI:
                 win_rate = (win_count / trade_count) if trade_count > 0 else 0
 
                 sharpe_ratio = 0.0
+                variance = 0.0
                 pnl_count = row_dict.get("pnl_count", 0) or 0
                 if pnl_count > 1:
                     mean_pnl = row_dict.get("avg_pnl", 0) or 0
@@ -331,6 +332,9 @@ def _build_app(static_dir: str | None = None) -> FastAPI:
                         ),
                         "sharpe_ratio": round(sharpe_ratio, 2),
                         "sharpe_note": "per-trade mean/stdev; not annualized",
+                        "stddev_pnl": round(
+                            math.sqrt(variance) if variance > 0 else 0.0, 4
+                        ),
                         "avg_edge_capture": round(
                             row_dict.get("avg_edge_capture", 0) or 0, 2
                         ),
@@ -369,6 +373,7 @@ def _build_app(static_dir: str | None = None) -> FastAPI:
                             "net_pnl": 0.0,
                             "sharpe_ratio": 0.0,
                             "sharpe_note": "per-trade mean/stdev; not annualized",
+                            "stddev_pnl": 0.0,
                             "avg_edge_capture": 0.0,
                             "avg_execution_time_ms": 0.0,
                             "signals_24h": signals_24h_map.get(strat, 0),
