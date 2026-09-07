@@ -596,11 +596,16 @@ def _build_app(static_dir: str | None = None) -> FastAPI:
                 (max_pos_exposure / total_capital * 100) if total_capital > 0 else 0
             )
 
-            cursor = await db.execute("""
+            cursor = await db.execute(
+                """
                 SELECT DATE(created_at) as trade_date, SUM(actual_pnl) as daily_pnl
-                FROM trade_outcomes GROUP BY DATE(created_at)
+                FROM trade_outcomes
+                WHERE created_at >= ?
+                GROUP BY DATE(created_at)
                 ORDER BY trade_date DESC LIMIT 30
-                """)
+                """,
+                (_cutoff_90d,),
+            )
             daily_rows = await cursor.fetchall()
             daily_pnls = [
                 r["daily_pnl"] for r in daily_rows if r["daily_pnl"] is not None
@@ -636,7 +641,7 @@ def _build_app(static_dir: str | None = None) -> FastAPI:
                 "concentration_pct": round(concentration, 2),
                 "daily_var": round(daily_var, 2),
                 "daily_var_sample_size": len(daily_pnls),
-                "daily_var_reliable": len(daily_pnls) >= 10,
+                "daily_var_reliable": len(daily_pnls) >= 20,
                 "daily_var_confidence_pct": round((1 - _VAR_TAIL_PCT) * 100),
                 "sharpe_overall": round(overall_sharpe, 2),
                 "sharpe_sample_size": len(pnl_values),
