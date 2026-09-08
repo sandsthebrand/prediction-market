@@ -191,8 +191,26 @@ class TestStrategiesEndpoint:
         rows = resp.json()
         assert len(rows) == 1
         row = rows[0]
-        for key in ("strategy", "trade_count", "win_count", "avg_pnl", "total_pnl"):
+        for key in (
+            "strategy",
+            "trade_count",
+            "win_count",
+            "avg_pnl",
+            "total_pnl",
+            "signals_24h",
+            "total_signals_in_window",
+        ):
             assert key in row, f"Missing key: {key}"
+
+    async def test_total_signals_in_window_present(self, app_and_client):
+        """total_signals_in_window reflects signals fired in the requested days window."""
+        _, client, _ = app_and_client
+        resp = await client.get("/api/strategies")
+        assert resp.status_code == 200
+        # Empty DB → empty list; field must be present when rows exist
+        rows = resp.json()
+        for row in rows:
+            assert "total_signals_in_window" in row
 
     async def test_days_param_filters_results(self, app_and_client):
         """?days=1 vs ?days=30 — with fresh data, both return the same row."""
@@ -349,6 +367,30 @@ class TestRiskEndpoint:
         data = resp.json()
         assert data["max_drawdown_pct"] == 0
         assert data["sharpe_overall"] == 0
+
+    async def test_new_daily_risk_fields_present(self, app_and_client):
+        _, client, _ = app_and_client
+        resp = await client.get("/api/risk")
+        assert resp.status_code == 200
+        data = resp.json()
+        for key in (
+            "worst_day_pnl",
+            "best_day_pnl",
+            "profitable_days_pct",
+            "profitable_days",
+            "total_days_with_trades_last30",
+        ):
+            assert key in data, f"Missing key: {key}"
+
+    async def test_new_daily_risk_fields_zero_on_empty_db(self, app_and_client):
+        _, client, _ = app_and_client
+        resp = await client.get("/api/risk")
+        data = resp.json()
+        assert data["worst_day_pnl"] == 0.0
+        assert data["best_day_pnl"] == 0.0
+        assert data["profitable_days_pct"] == 0.0
+        assert data["profitable_days"] == 0
+        assert data["total_days_with_trades_last30"] == 0
 
 
 # ── /api/fees ───────────────────────────────────────────────────────────────────────────────────────────

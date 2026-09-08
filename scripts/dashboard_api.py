@@ -293,6 +293,14 @@ def _build_app(static_dir: str | None = None) -> FastAPI:
             signals_rows = await signals_cursor.fetchall()
             signals_24h_map = {r["strategy"]: r["cnt"] for r in signals_rows}
 
+            signals_window_cursor = await db.execute(
+                "SELECT strategy, COUNT(*) as cnt FROM signals "
+                "WHERE fired_at >= ? GROUP BY strategy",
+                (cutoff_date.isoformat(),),
+            )
+            signals_window_rows = await signals_window_cursor.fetchall()
+            signals_window_map = {r["strategy"]: r["cnt"] for r in signals_window_rows}
+
             strategies = []
             for row in rows:
                 row_dict = dict(row)
@@ -342,6 +350,9 @@ def _build_app(static_dir: str | None = None) -> FastAPI:
                             row_dict.get("avg_execution_time_ms", 0) or 0
                         ),
                         "signals_24h": signals_24h_map.get(row_dict.get("strategy"), 0),
+                        "total_signals_in_window": signals_window_map.get(
+                            row_dict.get("strategy"), 0
+                        ),
                         "avg_spread_at_signal": round(
                             row_dict.get("avg_spread_at_signal", 0) or 0, 4
                         ),
@@ -377,6 +388,7 @@ def _build_app(static_dir: str | None = None) -> FastAPI:
                             "avg_edge_capture": 0.0,
                             "avg_execution_time_ms": 0.0,
                             "signals_24h": signals_24h_map.get(strat, 0),
+                            "total_signals_in_window": signals_window_map.get(strat, 0),
                             "avg_spread_at_signal": 0.0,
                             "max_pnl": 0.0,
                             "min_pnl": 0.0,
@@ -622,7 +634,7 @@ def _build_app(static_dir: str | None = None) -> FastAPI:
 
             cursor = await db.execute(
                 "SELECT actual_pnl FROM trade_outcomes WHERE actual_pnl IS NOT NULL"
-                " AND created_at >= ? ORDER BY created_at DESC LIMIT 500",
+                " AND created_at >= ?",
                 (_cutoff_90d,),
             )
             pnl_rows = await cursor.fetchall()
@@ -635,6 +647,13 @@ def _build_app(static_dir: str | None = None) -> FastAPI:
                 if stdev_pnl > 0:
                     overall_sharpe = mean_pnl / stdev_pnl
 
+            worst_day_pnl = round(min(daily_pnls), 2) if daily_pnls else 0.0
+            best_day_pnl = round(max(daily_pnls), 2) if daily_pnls else 0.0
+            profitable_days = sum(1 for p in daily_pnls if p > 0)
+            profitable_days_pct = (
+                round(profitable_days / len(daily_pnls) * 100, 1) if daily_pnls else 0.0
+            )
+
             return {
                 "max_drawdown": round(max_drawdown_dollar, 2),
                 "max_drawdown_pct": round(max_drawdown, 2),
@@ -645,6 +664,11 @@ def _build_app(static_dir: str | None = None) -> FastAPI:
                 "daily_var_confidence_pct": round((1 - _VAR_TAIL_PCT) * 100),
                 "sharpe_overall": round(overall_sharpe, 2),
                 "sharpe_sample_size": len(pnl_values),
+                "worst_day_pnl": worst_day_pnl,
+                "best_day_pnl": best_day_pnl,
+                "profitable_days_pct": profitable_days_pct,
+                "profitable_days": profitable_days,
+                "total_days_with_trades_last30": len(daily_pnls),
             }
         finally:
             await close_db(db)
