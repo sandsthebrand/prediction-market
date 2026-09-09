@@ -27,12 +27,13 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
         try:
             resolved=await self._book_resolver.resolve(leg.market_id,leg.side,leg.size,leg.limit_price)
             if resolved is None:raise ValueError("BookResolver rejected order")
-            self._ensure_client(); self._translated_orders[str(leg.market_id)]=resolved.translated
+            self._ensure_client()
             from py_clob_client_v2 import OrderArgs,OrderType,PartialCreateOrderOptions,Side as PolySide
             side=PolySide.BUY if resolved.side is Side.BUY else PolySide.SELL; tick=await self._call(self._client.get_tick_size,resolved.token_id)
             response=await self._call(self._client.create_and_post_order,OrderArgs(token_id=resolved.token_id,price=resolved.limit_price,side=side,size=resolved.size),PartialCreateOrderOptions(tick_size=str(tick)),OrderType.GTC)
             oid=response.get("orderID") or response.get("order_id") or response.get("id")
             if not oid:raise RuntimeError(f"Polymarket V2 returned no order id: {response}")
+            self._translated_orders[str(oid)]=resolved.translated
             await self.write_order(leg,OrderResult(order_id=oid,platform="polymarket",status="pending",submission_latency_ms=int((time.time()-start)*1000)),signal_id=signal_id,strategy=strategy); return await self._poll(oid,leg,start)
         except Exception as exc:
             result=OrderResult(order_id=f"FAILED-{leg.market_id}",platform="polymarket",status="failed",submission_latency_ms=int((time.time()-start)*1000),error_message=str(exc)); await self.write_order(leg,result,signal_id=signal_id,strategy=strategy); logger.exception("Polymarket V2 order failed"); return result
@@ -49,8 +50,7 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
         try:
             info=await self._call(self._client.get_clob_market_info,condition_id); rate=float((info.get("fd") or {}).get("r",0.0)); return round(size*rate*price*(1.0-price),5)
         except Exception:return 0.0
-    def economic_fill_price(self,order_id,price):
-        return 1.0-float(price) if self._translated_orders.get(str(order_id),False) else float(price)
+    def economic_fill_price(self,order_id,price):return 1.0-float(price) if self._translated_orders.get(str(order_id),False) else float(price)
     async def cancel_order(self,oid):
         try:
             from py_clob_client_v2 import OrderPayload
