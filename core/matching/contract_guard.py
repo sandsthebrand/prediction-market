@@ -61,7 +61,10 @@ async def verify_contract_equivalence(
     poly_source = _source_url_domain(poly[4])
     kalshi_source = _source_url_domain(kalshi[4])
     if poly_source and kalshi_source and poly_source != kalshi_source:
-        return False, f"resolution source URLs conflict: {poly_source} vs {kalshi_source}"
+        return (
+            False,
+            f"resolution source URLs conflict: {poly_source} vs {kalshi_source}",
+        )
 
     poly_date = _date(poly[7] or poly[6])
     kalshi_date = _date(kalshi[7] or kalshi[6])
