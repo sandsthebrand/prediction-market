@@ -122,7 +122,9 @@ class KalshiExecutionClientV2(BaseExecutionClient):
                 submission_latency_ms=int((time.time() - start) * 1000),
                 error_message=str(exc),
             )
-            await self.write_order(result=result, leg=leg, signal_id=signal_id, strategy=strategy)
+            await self.write_order(
+                result=result, leg=leg, signal_id=signal_id, strategy=strategy
+            )
             logger.exception("Kalshi V2 order failed")
             return result
 
@@ -210,7 +212,9 @@ class KalshiExecutionClientV2(BaseExecutionClient):
             response = await self.http_client.get(
                 self.api_base + "/portfolio/balance", headers=self._sign("GET", path)
             )
-            raw = response.json().get("balance", 0) if response.status_code == 200 else 0
+            raw = (
+                response.json().get("balance", 0) if response.status_code == 200 else 0
+            )
             return float(raw) / 100.0 if float(raw) > 1000 else float(raw)
         except Exception:
             logger.exception("Kalshi balance lookup failed")
