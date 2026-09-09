@@ -172,7 +172,9 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
             scale = 10**exponent
             return -(-raw * scale // 1) / scale
         except Exception as exc:
-            raise RuntimeError(f"Unable to verify Polymarket fee for fill: {exc}") from exc
+            raise RuntimeError(
+                f"Unable to verify Polymarket fee for fill: {exc}"
+            ) from exc
 
     def economic_fill_price(self, order_id, price):
         return (
