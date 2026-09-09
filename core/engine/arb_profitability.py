@@ -1,16 +1,13 @@
 """Executable profitability calculations for Phase 1 arbitrage.
 
-This module intentionally has no fixed dollar-profit floor. A $0.15 edge can
-be worth taking and a $15 edge can be rejected if execution costs/risk make it
-negative. The decision is based on executable prices, fees, slippage and size.
-
-Venue fee schedules are configuration inputs. They must be verified against
-current venue documentation before live trading; the code never silently
-assumes that a hard-coded fee is authoritative.
+There is intentionally no fixed dollar-profit floor. The gate asks whether an
+opportunity is positive after executable price, fee curve, slippage and other
+known costs. A small positive opportunity can therefore trade if execution
+risk is acceptable.
 """
-
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -32,6 +29,18 @@ def _price_ok(price: float) -> bool:
     return 0.0 < price < 1.0
 
 
+def _quadratic_fee(quantity: float, price: float, rate: float) -> float:
+    """Prediction-market taker fee: C * r * p * (1-p).
+
+    Both current Polymarket and Kalshi public fee documentation describe
+    prediction-market fees using a price-dependent expected-earnings curve,
+    though individual markets can have different rates/schedules. We round
+    upward for the pre-trade estimate so the gate is conservative.
+    """
+    raw = quantity * rate * price * (1.0 - price)
+    return math.ceil(raw * 10000.0) / 10000.0
+
+
 def calculate_executable_arb(
     *,
     buy_price: float,
@@ -42,13 +51,7 @@ def calculate_executable_arb(
     slippage_bps: float = 0.0,
     extra_cost: float = 0.0,
 ) -> ExecutableArb | None:
-    """Calculate net executable profit for a matched pair.
-
-    Fees are applied to the notional of each leg. Slippage is modeled as an
-    adverse movement on both legs from the observed executable prices. This is
-    deliberately conservative and is used for pre-trade estimation; realized
-    P&L must use actual fill prices and actual fee records.
-    """
+    """Calculate conservative pre-trade net profit for a matched pair."""
     if (
         not _price_ok(buy_price)
         or not _price_ok(sell_price)
@@ -64,8 +67,8 @@ def calculate_executable_arb(
     effective_buy = min(0.999999, buy_price * (1.0 + slip))
     effective_sell = max(0.000001, sell_price * (1.0 - slip))
     gross = (effective_sell - effective_buy) * quantity
-    buy_fee = effective_buy * quantity * buy_fee_rate
-    sell_fee = effective_sell * quantity * sell_fee_rate
+    buy_fee = _quadratic_fee(quantity, effective_buy, buy_fee_rate)
+    sell_fee = _quadratic_fee(quantity, effective_sell, sell_fee_rate)
     net = gross - buy_fee - sell_fee - extra_cost
 
     return ExecutableArb(
