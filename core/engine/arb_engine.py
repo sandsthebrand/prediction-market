@@ -1,18 +1,17 @@
 """Phase 1 hardened arbitrage engine."""
 from __future__ import annotations
-
 import copy
 import logging
 import os
 import uuid
 from datetime import datetime, timezone
-
 from core.engine.arb_engine_legacy import ArbitrageEngine as _LegacyArbitrageEngine
 from core.engine.arb_execution import ArbExecutionEngine, ArbOutcome
 from core.engine.arb_profitability import calculate_executable_arb
 from core.engine.arb_depth import executable_quantity, get_executable_depth
 from core.engine.execution_control import halt, is_halted
 from core.engine.fire_state import _RiskLeg, _RiskSignal
+from core.matching.contract_guard import verify_contract_equivalence
 from execution.enums import Side
 from execution.models import OrderLeg
 
@@ -42,6 +41,12 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
             buy_client, sell_client = self._kalshi_client, self._poly_client
         if self._circuit_breaker is not None and await self._circuit_breaker.should_halt():
             return None
+
+        equivalent, reason = await verify_contract_equivalence(self.db, match["poly_id"], match["kalshi_id"])
+        if not equivalent:
+            logger.info("Phase1 contract guard rejected pair=%s: %s", pair_id, reason)
+            return None
+
         bankroll = await get_portfolio_value(self.db, self._risk_config.starting_capital)
         max_notional = bankroll * self._risk_config.max_position_pct
         if bankroll <= 0 or max_notional <= 0:
@@ -68,10 +73,8 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
         buy_leg = OrderLeg(market_id=buy_id, platform=buy_platform, side=Side.BUY, size=size, limit_price=buy_price, order_type="LIMIT")
         sell_leg = OrderLeg(market_id=sell_id, platform=sell_platform, side=Side.SELL, size=size, limit_price=sell_price, order_type="LIMIT")
         min_edge = float(os.getenv("PHASE1_MIN_NET_EDGE", "0.005"))
-        executable = calculate_executable_arb(
-            buy_price=buy_price, sell_price=sell_price, quantity=size,
-            buy_fee_rate=self._fee_rate(buy_platform, buy_price),
-            sell_fee_rate=self._fee_rate(sell_platform, sell_price),
+        executable = calculate_executable_arb(buy_price=buy_price, sell_price=sell_price, quantity=size,
+            buy_fee_rate=self._fee_rate(buy_platform, buy_price), sell_fee_rate=self._fee_rate(sell_platform, sell_price),
             slippage_bps=self._risk_config.slippage_bps)
         if executable is None or not executable.profitable or executable.net_edge_per_contract < min_edge:
             return None
@@ -90,17 +93,15 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
         except Exception:
             logger.exception("Phase1 opportunity persistence failed; no order sent")
             return None
-        risk_signal = _RiskSignal(
-            legs=[_RiskLeg(market_id=buy_id, limit_price=buy_price, size=size, side="BUY"),
-                  _RiskLeg(market_id=sell_id, limit_price=sell_price, size=size, side="SELL")],
-            edge=executable.net_edge_per_contract, strategy=strategy, violation_id=violation_id)
+        risk_signal = _RiskSignal(legs=[_RiskLeg(market_id=buy_id, limit_price=buy_price, size=size, side="BUY"),
+                                        _RiskLeg(market_id=sell_id, limit_price=sell_price, size=size, side="SELL")],
+                                  edge=executable.net_edge_per_contract, strategy=strategy, violation_id=violation_id)
         risk_config = copy.copy(self._risk_config)
         risk_config.min_edge = min_edge
         all_passed, checks = await run_all_checks(risk_signal, risk_config, self.db, portfolio_value=bankroll)
         if not all_passed:
             failed = [r.check_type for r in checks if not r.passed]
-            await self.db.execute("UPDATE violations SET status='risk_rejected', rejection_reason=?, updated_at=? WHERE id=?",
-                                  (", ".join(failed), now, violation_id))
+            await self.db.execute("UPDATE violations SET status='risk_rejected', rejection_reason=?, updated_at=? WHERE id=?", (", ".join(failed), now, violation_id))
             await self.db.commit()
             return None
         try:
@@ -108,16 +109,15 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
                 (id, violation_id, strategy, signal_type, market_id_a, market_id_b, target_price_a, target_price_b,
                  model_edge, kelly_fraction, position_size_a, position_size_b, total_capital_at_risk, status, fired_at, updated_at)
                 VALUES (?, ?, ?, 'arb_pair', ?, ?, ?, ?, ?, 0, ?, ?, ?, 'fired', ?, ?)""",
-                (signal_id, violation_id, strategy, buy_id, sell_id, buy_price, sell_price,
-                 executable.net_edge_per_contract, size, size, size * (buy_price + sell_price), now, now))
+                (signal_id, violation_id, strategy, buy_id, sell_id, buy_price, sell_price, executable.net_edge_per_contract,
+                 size, size, size * (buy_price + sell_price), now, now))
             await self.db.commit()
         except Exception:
             logger.exception("Phase1 signal persistence failed; no order sent")
             return None
         max_unhedged = min(bankroll * self._risk_config.max_position_pct, bankroll * self._risk_config.max_portfolio_exposure_pct)
         execution = await ArbExecutionEngine(max_unhedged_exposure_usd=max_unhedged, on_halt=lambda reason: halt(self.db, reason)).execute(
-            buy_client=buy_client, sell_client=sell_client, buy_leg=buy_leg, sell_leg=sell_leg,
-            signal_id=signal_id, strategy=strategy)
+            buy_client=buy_client, sell_client=sell_client, buy_leg=buy_leg, sell_leg=sell_leg, signal_id=signal_id, strategy=strategy)
         if execution.outcome is not ArbOutcome.BOTH_FILLED:
             await self._record_execution_failure(violation_id, execution.outcome.value, execution.detail)
             return None
@@ -133,8 +133,8 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
                 (id, signal_id, market_id, strategy, side, book, entry_price, entry_size, exit_price, exit_size,
                  realized_pnl, fees_paid, pnl_model, status, opened_at, closed_at, updated_at)
                 VALUES (?, ?, ?, ?, 'BUY', 'YES', ?, ?, ?, ?, ?, ?, 'realistic', 'closed', ?, ?, ?)""",
-                (pos_id, signal_id, buy_id, strategy, buy_result.filled_price, matched_qty,
-                 sell_result.filled_price, matched_qty, actual_pnl, actual_fees, now, now, now))
+                (pos_id, signal_id, buy_id, strategy, buy_result.filled_price, matched_qty, sell_result.filled_price,
+                 matched_qty, actual_pnl, actual_fees, now, now, now))
             await self.db.execute("""INSERT INTO trade_outcomes
                 (id, signal_id, strategy, violation_id, market_id_a, market_id_b, predicted_edge, predicted_pnl,
                  actual_pnl, fees_total, edge_captured_pct, signal_to_fill_ms, holding_period_ms, spread_at_signal,
@@ -159,13 +159,11 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
 
     @staticmethod
     def _fee_rate(platform: str, price: float) -> float:
-        return float(os.getenv("POLYMARKET_FEE_RATE" if platform == "polymarket" else "KALSHI_FEE_RATE",
-                              "0.05" if platform == "polymarket" else "0.07"))
+        return float(os.getenv("POLYMARKET_FEE_RATE" if platform == "polymarket" else "KALSHI_FEE_RATE", "0.05" if platform == "polymarket" else "0.07"))
 
     async def _record_execution_failure(self, violation_id: str, outcome: str, detail: str) -> None:
         try:
-            await self.db.execute("UPDATE violations SET status=?, rejection_reason=?, updated_at=? WHERE id=?",
-                                  (outcome, detail[:2000], datetime.now(timezone.utc).isoformat(), violation_id))
+            await self.db.execute("UPDATE violations SET status=?, rejection_reason=?, updated_at=? WHERE id=?", (outcome, detail[:2000], datetime.now(timezone.utc).isoformat(), violation_id))
             await self.db.commit()
         except Exception:
             logger.exception("Could not record Phase1 execution outcome")
