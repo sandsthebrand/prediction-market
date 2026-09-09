@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from urllib.parse import urlparse
 
 
 def _date(value):
@@ -17,6 +18,20 @@ def _date(value):
 
 def _numbers(text: str | None) -> set[str]:
     return set(re.findall(r"\b\d+(?:\.\d+)?\b", text or ""))
+
+
+def _source_url_domain(value: str | None) -> str | None:
+    """Return a normalized hostname only when metadata contains a URL."""
+    if not value:
+        return None
+    text = value.strip()
+    if "://" not in text:
+        return None
+    try:
+        host = (urlparse(text).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return None
+    return host or None
 
 
 async def verify_contract_equivalence(
@@ -36,27 +51,33 @@ async def verify_contract_equivalence(
     rows = await cur.fetchall()
     if len(rows) != 2:
         return False, "missing market metadata"
+
     by_platform = {str(row[0]).lower(): row for row in rows}
-    p = by_platform.get("polymarket")
-    k = by_platform.get("kalshi")
-    if p is None or k is None:
+    poly = by_platform.get("polymarket")
+    kalshi = by_platform.get("kalshi")
+    if poly is None or kalshi is None:
         return False, "pair does not contain one Polymarket and one Kalshi market"
 
-    if p[4] and k[4] and p[4].strip().lower() != k[4].strip().lower():
-        return False, "resolution sources conflict"
+    poly_source = _source_url_domain(poly[4])
+    kalshi_source = _source_url_domain(kalshi[4])
+    if poly_source and kalshi_source and poly_source != kalshi_source:
+        return False, f"resolution source URLs conflict: {poly_source} vs {kalshi_source}"
 
-    p_date = _date(p[7] or p[6])
-    k_date = _date(k[7] or k[6])
-    if p_date and k_date and p_date != k_date:
-        return False, f"resolution dates conflict: {p_date} vs {k_date}"
-    if not p[5] or not k[5]:
+    poly_date = _date(poly[7] or poly[6])
+    kalshi_date = _date(kalshi[7] or kalshi[6])
+    if poly_date and kalshi_date and poly_date != kalshi_date:
+        return False, f"resolution dates conflict: {poly_date} vs {kalshi_date}"
+    if not poly[5] or not kalshi[5]:
         return False, "resolution criteria missing on one side"
 
     # Different numeric thresholds in otherwise similar contracts are a hard
     # reject. This catches units/threshold drift that fuzzy title matching can miss.
-    pn = _numbers(p[5] + " " + (p[1] or ""))
-    kn = _numbers(k[5] + " " + (k[1] or ""))
-    if pn and kn and pn != kn:
-        return False, f"resolution thresholds/numbers conflict: {pn} vs {kn}"
+    poly_numbers = _numbers((poly[5] or "") + " " + (poly[1] or ""))
+    kalshi_numbers = _numbers((kalshi[5] or "") + " " + (kalshi[1] or ""))
+    if poly_numbers and kalshi_numbers and poly_numbers != kalshi_numbers:
+        return False, (
+            "resolution thresholds/numbers conflict: "
+            f"{poly_numbers} vs {kalshi_numbers}"
+        )
 
     return True, "resolution metadata compatible"
