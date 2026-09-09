@@ -1,4 +1,5 @@
 """Pre-trade executable order-book depth checks for Phase 1."""
+
 from __future__ import annotations
 
 import httpx
@@ -16,12 +17,16 @@ async def _polymarket_depth(client, leg: OrderLeg) -> float | None:
     resolver = getattr(client, "_book_resolver", None)
     if resolver is None:
         return None
-    resolved = await resolver.resolve(leg.market_id, leg.side, leg.size, leg.limit_price)
+    resolved = await resolver.resolve(
+        leg.market_id, leg.side, leg.size, leg.limit_price
+    )
     if resolved is None:
         return None
     host = getattr(client, "host", "https://clob.polymarket.com").rstrip("/")
     async with httpx.AsyncClient(timeout=5.0) as http:
-        response = await http.get(f"{host}/book", params={"token_id": resolved.token_id})
+        response = await http.get(
+            f"{host}/book", params={"token_id": resolved.token_id}
+        )
         response.raise_for_status()
         book = response.json()
     total = 0.0
@@ -30,7 +35,9 @@ async def _polymarket_depth(client, leg: OrderLeg) -> float | None:
             price, size = _level_values(level)
         except (TypeError, ValueError, KeyError, IndexError):
             continue
-        if (resolved.side is Side.BUY and price <= resolved.limit_price) or (resolved.side is Side.SELL and price >= resolved.limit_price):
+        if (resolved.side is Side.BUY and price <= resolved.limit_price) or (
+            resolved.side is Side.SELL and price >= resolved.limit_price
+        ):
             total += size
     return total
 
@@ -39,7 +46,9 @@ async def _kalshi_depth(client, leg: OrderLeg) -> float | None:
     base = getattr(client, "api_base", None)
     if not base:
         return None
-    limiter = getattr(client, "_limit", None) or getattr(client, "_acquire_rate_limit", None)
+    limiter = getattr(client, "_limit", None) or getattr(
+        client, "_acquire_rate_limit", None
+    )
     signer = getattr(client, "_sign", None) or getattr(client, "_sign_request", None)
     if limiter is None or signer is None:
         return None
@@ -50,7 +59,11 @@ async def _kalshi_depth(client, leg: OrderLeg) -> float | None:
     if response.status_code != 200:
         return None
     data = response.json().get("orderbook_fp", {})
-    levels = data.get("yes_dollars", []) if leg.side is Side.SELL else data.get("no_dollars", [])
+    levels = (
+        data.get("yes_dollars", [])
+        if leg.side is Side.SELL
+        else data.get("no_dollars", [])
+    )
     total = 0.0
     for level in levels:
         try:
@@ -58,15 +71,21 @@ async def _kalshi_depth(client, leg: OrderLeg) -> float | None:
         except (TypeError, ValueError, IndexError):
             continue
         effective_yes_price = price if leg.side is Side.SELL else 1.0 - price
-        if (leg.side is Side.BUY and effective_yes_price <= float(leg.limit_price)) or (leg.side is Side.SELL and effective_yes_price >= float(leg.limit_price)):
+        if (leg.side is Side.BUY and effective_yes_price <= float(leg.limit_price)) or (
+            leg.side is Side.SELL and effective_yes_price >= float(leg.limit_price)
+        ):
             total += size
     return total
 
 
 async def get_executable_depth(client, leg: OrderLeg) -> float | None:
     """Return quantity immediately executable within the leg's limit price."""
-    label = str(getattr(client, "platform", getattr(client, "platform_label", ""))).lower()
-    if label.startswith("paper") or client.__class__.__name__.lower().startswith("paper"):
+    label = str(
+        getattr(client, "platform", getattr(client, "platform_label", ""))
+    ).lower()
+    if label.startswith("paper") or client.__class__.__name__.lower().startswith(
+        "paper"
+    ):
         return float(leg.size)
     if leg.platform == "polymarket":
         return await _polymarket_depth(client, leg)
@@ -75,7 +94,9 @@ async def get_executable_depth(client, leg: OrderLeg) -> float | None:
     return None
 
 
-def executable_quantity(depth_a: float | None, depth_b: float | None, requested: float) -> float | None:
+def executable_quantity(
+    depth_a: float | None, depth_b: float | None, requested: float
+) -> float | None:
     if requested <= 0 or depth_a is None or depth_b is None:
         return None
     depth = min(max(0.0, float(depth_a)), max(0.0, float(depth_b)))

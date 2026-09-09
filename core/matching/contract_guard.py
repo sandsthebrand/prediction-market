@@ -1,4 +1,5 @@
 """Fail-closed contract-equivalence guard for cross-platform arbitrage."""
+
 from __future__ import annotations
 
 import re
@@ -18,7 +19,9 @@ def _numbers(text: str | None) -> set[str]:
     return set(re.findall(r"\b\d+(?:\.\d+)?\b", text or ""))
 
 
-async def verify_contract_equivalence(db, poly_market_id: str, kalshi_market_id: str) -> tuple[bool, str]:
+async def verify_contract_equivalence(
+    db, poly_market_id: str, kalshi_market_id: str
+) -> tuple[bool, str]:
     """Verify material resolution metadata before a P1 trade.
 
     Similarity alone is not enough. A pair is rejected when authoritative

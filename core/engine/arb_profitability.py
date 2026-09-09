@@ -5,6 +5,7 @@ opportunity is positive after executable price, fee curve, slippage and other
 known costs. A small positive opportunity can therefore trade if execution
 risk is acceptable.
 """
+
 from __future__ import annotations
 
 import math

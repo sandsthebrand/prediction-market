@@ -34,7 +34,9 @@ async def halt(db: aiosqlite.Connection, reason: str) -> None:
     logger.critical("PHASE1 EXECUTION HALTED: %s", reason)
 
 
-async def clear_halt(db: aiosqlite.Connection, reason: str = "operator re-armed") -> None:
+async def clear_halt(
+    db: aiosqlite.Connection, reason: str = "operator re-armed"
+) -> None:
     now = datetime.now(timezone.utc).isoformat()
     await db.execute(
         """UPDATE execution_control
