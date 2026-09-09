@@ -1,15 +1,22 @@
 """Kalshi current event-order API client."""
 
 from __future__ import annotations
-import asyncio, base64, logging, os, time, uuid
+
+import asyncio
+import base64
+import logging
+import os
+import time
+import uuid
 from pathlib import Path
-import aiosqlite, httpx
+
+import aiosqlite
+import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from core.secrets import get_secret
 from execution.clients.base import BaseExecutionClient, OrderResult
-from execution.models import OrderLeg
 
 logger = logging.getLogger(__name__)
 
@@ -81,9 +88,9 @@ class KalshiExecutionClientV2(BaseExecutionClient):
                 "ticker": leg.market_id,
                 "client_order_id": cid,
                 "side": "bid" if leg.side.value == "BUY" else "ask",
-                "count": f"{leg.size:.4f}",
+                "count": f"{leg.size:.2f}",
                 "price": f"{leg.limit_price:.4f}",
-                "time_in_force": "good_till_canceled",
+                "time_in_force": "immediate_or_cancel",
                 "self_trade_prevention_type": "taker_at_cross",
                 "cancel_order_on_pause": True,
             }
@@ -115,7 +122,7 @@ class KalshiExecutionClientV2(BaseExecutionClient):
                 submission_latency_ms=int((time.time() - start) * 1000),
                 error_message=str(exc),
             )
-            await self.write_order(leg, result, signal_id=signal_id, strategy=strategy)
+            await self.write_order(result=result, leg=leg, signal_id=signal_id, strategy=strategy)
             logger.exception("Kalshi V2 order failed")
             return result
 
@@ -133,18 +140,12 @@ class KalshiExecutionClientV2(BaseExecutionClient):
             order = response.json().get("order", response.json())
             status = str(order.get("status", "")).lower()
             matched = float(order.get("fill_count_fp", order.get("fill_count", 0)) or 0)
-            if matched > 0 and status == "resting":
-                await self.cancel_order(oid)
-                status = "cancelled"
             if status in {"executed", "filled", "canceled", "cancelled"}:
                 if matched > 0:
-                    price = float(
-                        order.get(
-                            "average_fill_price",
-                            order.get("yes_price_dollars", leg.limit_price),
-                        )
-                    )
-                    fee = float(order.get("average_fee_paid", 0) or 0) * matched
+                    price = float(order.get("yes_price_dollars", leg.limit_price))
+                    taker_fee = float(order.get("taker_fees_dollars", 0) or 0)
+                    maker_fee = float(order.get("maker_fees_dollars", 0) or 0)
+                    fee = taker_fee + maker_fee
                     result = OrderResult(
                         order_id=oid,
                         platform="kalshi",
@@ -163,7 +164,7 @@ class KalshiExecutionClientV2(BaseExecutionClient):
                     platform="kalshi",
                     status="failed",
                     submission_latency_ms=int((time.time() - start) * 1000),
-                    error_message="order cancelled",
+                    error_message="order cancelled without fill",
                 )
                 await self.update_order_fill(result)
                 return result
@@ -209,9 +210,7 @@ class KalshiExecutionClientV2(BaseExecutionClient):
             response = await self.http_client.get(
                 self.api_base + "/portfolio/balance", headers=self._sign("GET", path)
             )
-            raw = (
-                response.json().get("balance", 0) if response.status_code == 200 else 0
-            )
+            raw = response.json().get("balance", 0) if response.status_code == 200 else 0
             return float(raw) / 100.0 if float(raw) > 1000 else float(raw)
         except Exception:
             logger.exception("Kalshi balance lookup failed")
