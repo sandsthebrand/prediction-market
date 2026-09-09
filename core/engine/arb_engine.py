@@ -1,6 +1,7 @@
 """Phase 1 hardened arbitrage engine."""
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import uuid
@@ -23,7 +24,6 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
 
     async def _execute_arb_trade(self, match, p_price, k_price, spread, pair_id):
         from core.signals.risk import get_portfolio_value, run_all_checks
-
         if await is_halted(self.db) or not (0 < p_price < 1 and 0 < k_price < 1):
             return None
         strategy = "P1_cross_market_arb"
@@ -49,16 +49,14 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
         requested = round(max_notional / (buy_price + sell_price), 1)
         if requested <= 0:
             return None
-        buy_leg_probe = OrderLeg(market_id=buy_id, platform=buy_platform, side=Side.BUY, size=requested, limit_price=buy_price, order_type="LIMIT")
-        sell_leg_probe = OrderLeg(market_id=sell_id, platform=sell_platform, side=Side.SELL, size=requested, limit_price=sell_price, order_type="LIMIT")
+        buy_leg = OrderLeg(market_id=buy_id, platform=buy_platform, side=Side.BUY, size=requested, limit_price=buy_price, order_type="LIMIT")
+        sell_leg = OrderLeg(market_id=sell_id, platform=sell_platform, side=Side.SELL, size=requested, limit_price=sell_price, order_type="LIMIT")
         try:
-            buy_depth, sell_depth = await __import__("asyncio").gather(
-                get_executable_depth(buy_client, buy_leg_probe),
-                get_executable_depth(sell_client, sell_leg_probe),
-            )
+            import asyncio
+            buy_depth, sell_depth = await asyncio.gather(get_executable_depth(buy_client, buy_leg), get_executable_depth(sell_client, sell_leg))
         except Exception as exc:
-            logger.warning("Phase1 depth query failed pair=%s: %s", pair_id, exc)
-            await halt(self.db, f"depth query failure before arb submission pair={pair_id}")
+            logger.exception("Phase1 depth query failed pair=%s", pair_id)
+            await halt(self.db, f"depth query failure before arb submission pair={pair_id}: {exc}")
             return None
         size = executable_quantity(buy_depth, sell_depth, requested)
         if size is None:
@@ -67,13 +65,15 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
         size = round(size, 1)
         if size <= 0:
             return None
+        buy_leg = OrderLeg(market_id=buy_id, platform=buy_platform, side=Side.BUY, size=size, limit_price=buy_price, order_type="LIMIT")
+        sell_leg = OrderLeg(market_id=sell_id, platform=sell_platform, side=Side.SELL, size=size, limit_price=sell_price, order_type="LIMIT")
+        min_edge = float(os.getenv("PHASE1_MIN_NET_EDGE", "0.005"))
         executable = calculate_executable_arb(
             buy_price=buy_price, sell_price=sell_price, quantity=size,
             buy_fee_rate=self._fee_rate(buy_platform, buy_price),
             sell_fee_rate=self._fee_rate(sell_platform, sell_price),
-            slippage_bps=self._risk_config.slippage_bps,
-        )
-        if executable is None or not executable.profitable or executable.net_edge_per_contract < self._risk_config.min_edge:
+            slippage_bps=self._risk_config.slippage_bps)
+        if executable is None or not executable.profitable or executable.net_edge_per_contract < min_edge:
             return None
         try:
             await self.db.execute("""INSERT OR IGNORE INTO market_pairs
@@ -94,7 +94,9 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
             legs=[_RiskLeg(market_id=buy_id, limit_price=buy_price, size=size, side="BUY"),
                   _RiskLeg(market_id=sell_id, limit_price=sell_price, size=size, side="SELL")],
             edge=executable.net_edge_per_contract, strategy=strategy, violation_id=violation_id)
-        all_passed, checks = await run_all_checks(risk_signal, self._risk_config, self.db, portfolio_value=bankroll)
+        risk_config = copy.copy(self._risk_config)
+        risk_config.min_edge = min_edge
+        all_passed, checks = await run_all_checks(risk_signal, risk_config, self.db, portfolio_value=bankroll)
         if not all_passed:
             failed = [r.check_type for r in checks if not r.passed]
             await self.db.execute("UPDATE violations SET status='risk_rejected', rejection_reason=?, updated_at=? WHERE id=?",
@@ -112,8 +114,6 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
         except Exception:
             logger.exception("Phase1 signal persistence failed; no order sent")
             return None
-        buy_leg = buy_leg_probe
-        sell_leg = sell_leg_probe
         max_unhedged = min(bankroll * self._risk_config.max_position_pct, bankroll * self._risk_config.max_portfolio_exposure_pct)
         execution = await ArbExecutionEngine(max_unhedged_exposure_usd=max_unhedged, on_halt=lambda reason: halt(self.db, reason)).execute(
             buy_client=buy_client, sell_client=sell_client, buy_leg=buy_leg, sell_leg=sell_leg,
