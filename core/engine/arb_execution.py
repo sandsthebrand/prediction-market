@@ -1,11 +1,15 @@
 """Concurrent, fill-safe Phase 1 arbitrage execution."""
 
 from __future__ import annotations
-import asyncio, logging, time
+
+import asyncio
+import logging
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Awaitable, Callable
-from execution.clients.base import BaseExecutionClient, OrderResult
+
+from execution.clients.base import OrderResult
 from execution.models import OrderLeg
 
 logger = logging.getLogger(__name__)
@@ -132,7 +136,7 @@ class ArbExecutionEngine:
                 ),
                 return_exceptions=False,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - unknown exchange state must halt
             await self._halt(
                 f"arb leg submission exception; exchange state unknown: {exc}"
             )
@@ -217,7 +221,7 @@ class ArbExecutionEngine:
                     logger.error(
                         "Failed to cancel resting arb order %s", result.order_id
                     )
-            except Exception:
+            except Exception:  # noqa: BLE001 - cancellation failure is safety-critical
                 logger.exception(
                     "Exception cancelling resting arb order %s", result.order_id
                 )
@@ -239,7 +243,7 @@ class ArbExecutionEngine:
             result = await client.submit_order(
                 flatten_leg, signal_id=signal_id, strategy=strategy
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - flatten state is uncertain
             return FlattenAttempt(
                 original_leg.platform,
                 original_leg.market_id,
@@ -267,7 +271,7 @@ class ArbExecutionEngine:
         if self._on_halt:
             try:
                 await self._on_halt(reason)
-            except Exception:
+            except Exception:  # noqa: BLE001 - halt callback must not crash executor
                 logger.exception("Execution halt callback failed: %s", reason)
 
     def _result(
