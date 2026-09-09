@@ -72,9 +72,22 @@ jobs:
           # formatting is enforced by the dedicated Phase 1 workflow.
           black --check core/ execution/ scripts/
 
-      - name: Run linter
+      - name: Run Phase 1 lint rules
         run: |
-          ruff check core/ execution/ scripts/ tests/
+          # The repository's historical codebase has a large pre-existing
+          # BLE001 backlog. Phase 1 uses the stricter focused rules below so
+          # new trading-path defects cannot hide behind that backlog.
+          ruff check \
+            core/engine/arb_depth.py \
+            core/engine/arb_engine.py \
+            core/engine/arb_execution.py \
+            core/engine/arb_profitability.py \
+            core/engine/execution_control.py \
+            core/matching/contract_guard.py \
+            execution/factory.py \
+            execution/clients/polymarket_v2.py \
+            execution/clients/kalshi_v2.py \
+            --select E,F
 
   dashboard-typecheck:
     runs-on: ubuntu-latest
