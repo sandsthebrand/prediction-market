@@ -1,0 +1,49 @@
+name: Phase 1 formatter
+
+on:
+  push:
+    branches: [phase1-arb-hardening]
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: phase1-arb-hardening
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install black
+      - run: |
+          black \
+            core/engine/arb_depth.py \
+            core/engine/arb_engine.py \
+            core/engine/arb_engine_legacy.py \
+            core/engine/arb_execution.py \
+            core/engine/arb_profitability.py \
+            core/engine/execution_control.py \
+            core/engine/scheduler.py \
+            core/engine/scheduler_legacy.py \
+            core/matching/contract_guard.py \
+            execution/clients/kalshi_v2.py \
+            execution/clients/polymarket_v2.py \
+            execution/factory.py \
+            tests/unit/test_arb_execution.py \
+            tests/unit/test_arb_profitability.py
+      - name: Commit formatting
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git diff --quiet; then
+            echo 'Already formatted.'
+            exit 0
+          fi
+          git add core execution tests
+          git commit -m 'style: format Phase 1 Python files'
+          git push origin HEAD:phase1-arb-hardening
