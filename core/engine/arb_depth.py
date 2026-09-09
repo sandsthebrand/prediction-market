@@ -1,13 +1,16 @@
 """Pre-trade executable order-book depth checks for Phase 1."""
 from __future__ import annotations
 
-import asyncio
-import math
-
 import httpx
 
 from execution.enums import Side
 from execution.models import OrderLeg
+
+
+def _level_values(level):
+    if isinstance(level, dict):
+        return float(level["price"]), float(level["size"])
+    return float(level[0]), float(level[1])
 
 
 async def _polymarket_depth(client, leg: OrderLeg) -> float | None:
@@ -26,8 +29,7 @@ async def _polymarket_depth(client, leg: OrderLeg) -> float | None:
     total = 0.0
     for level in levels:
         try:
-            price = float(level.get("price", level[0]))
-            size = float(level.get("size", level[1]))
+            price, size = _level_values(level)
         except (TypeError, ValueError, KeyError, IndexError):
             continue
         if resolved.side is Side.BUY and price <= resolved.limit_price:
@@ -53,11 +55,9 @@ async def _kalshi_depth(client, leg: OrderLeg) -> float | None:
     total = 0.0
     for level in yes if leg.side is Side.SELL else no:
         try:
-            price = float(level[0])
-            size = float(level[1])
+            price, size = _level_values(level)
         except (TypeError, ValueError, IndexError):
             continue
-        # A no bid at q is a yes ask at 1-q.
         effective_yes_price = price if leg.side is Side.SELL else 1.0 - price
         if leg.side is Side.BUY and effective_yes_price <= float(leg.limit_price):
             total += size
@@ -67,12 +67,7 @@ async def _kalshi_depth(client, leg: OrderLeg) -> float | None:
 
 
 async def get_executable_depth(client, leg: OrderLeg) -> float | None:
-    """Return quantity immediately executable within the leg's limit price.
-
-    ``None`` means depth could not be verified and must be treated as a
-    fail-closed condition by live Phase 1. Paper execution is intentionally
-    exempt so the paper engine can model fills without a live venue.
-    """
+    """Return quantity immediately executable within the leg's limit price."""
     platform = str(getattr(client, "platform", getattr(client, "platform_label", ""))).lower()
     if platform == "paper":
         return float(leg.size)
