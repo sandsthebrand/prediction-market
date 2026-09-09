@@ -1,7 +1,12 @@
 """Polymarket CLOB V2 execution client."""
 
 from __future__ import annotations
-import asyncio, logging, os, time
+
+import asyncio
+import logging
+import os
+import time
+
 import aiosqlite
 from core.secrets import get_secret
 from execution.clients.base import BaseExecutionClient, OrderResult
@@ -37,7 +42,7 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
 
         if not self.private_key:
             raise ValueError("POLYMARKET_PRIVATE_KEY is required")
-        kwargs = {"host": self.host, "chain_id": self.chain_id, "key": self.private_key}
+        kwargs = {"host": self.host, "chain": self.chain_id, "key": self.private_key}
         if self.funder:
             kwargs.update(funder=self.funder, signature_type=self.signature_type)
         ak = get_secret("POLYMARKET_API_KEY", "") or ""
@@ -80,7 +85,7 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
                     size=resolved.size,
                 ),
                 PartialCreateOrderOptions(tick_size=str(tick)),
-                OrderType.GTC,
+                OrderType.FAK,
             )
             oid = (
                 response.get("orderID")
@@ -162,9 +167,12 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
         try:
             info = await self._call(self._client.get_clob_market_info, condition_id)
             rate = float((info.get("fd") or {}).get("r", 0.0))
-            return round(size * rate * price * (1.0 - price), 5)
-        except Exception:
-            return 0.0
+            exponent = int((info.get("fd") or {}).get("e", 2) or 2)
+            raw = size * rate * price * (1.0 - price)
+            scale = 10**exponent
+            return -(-raw * scale // 1) / scale
+        except Exception as exc:
+            raise RuntimeError(f"Unable to verify Polymarket fee for fill: {exc}") from exc
 
     def economic_fill_price(self, order_id, price):
         return (
