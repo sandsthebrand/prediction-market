@@ -668,7 +668,7 @@ def _build_app(static_dir: str | None = None) -> FastAPI:
                 "best_day_pnl": best_day_pnl,
                 "profitable_days_pct": profitable_days_pct,
                 "profitable_days": profitable_days,
-                "total_days_with_trades_last30": len(daily_pnls),
+                "total_days_with_trades_in_sample": len(daily_pnls),
             }
         finally:
             await close_db(db)

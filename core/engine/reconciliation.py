@@ -38,12 +38,14 @@ async def reconcile_internal_state(db: aiosqlite.Connection) -> dict[str, int]:
         "stuck_pending_orders": 0,
         "unbalanced_arb_pairs": 0,
         "closed_without_outcomes": 0,
+        "signals_without_orders": 0,
     }
 
     summary["orphaned_positions"] = await _check_orphaned_positions(db)
     summary["stuck_pending_orders"] = await _check_stuck_pending_orders(db)
     summary["unbalanced_arb_pairs"] = await _check_unbalanced_arb_pairs(db)
     summary["closed_without_outcomes"] = await _check_closed_without_outcomes(db)
+    summary["signals_without_orders"] = await _check_signals_without_orders(db)
 
     try:
         await db.commit()
@@ -305,6 +307,50 @@ async def _log_discrepancy(
             check_type,
             e,
         )
+
+
+async def _check_signals_without_orders(db: aiosqlite.Connection) -> int:
+    """Signals that were fired but generated no orders.
+
+    A signal with a ``fired_at`` timestamp that is older than 60 seconds
+    and has no rows in the ``orders`` table under the same ``id`` (signal_id)
+    indicates that order submission silently failed — either due to a
+    pre-submission exception in _execute_arb_trade or a DB write failure.
+
+    The 60-second age guard prevents false positives from in-flight signals
+    whose order rows haven't been written yet. Bounded to the last 30 days
+    to avoid a full-table scan as the signals table grows.
+    """
+    cutoff_30d = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    grace_period = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+    cursor = await db.execute(
+        """
+        SELECT s.id, s.strategy, s.fired_at
+        FROM signals s
+        WHERE s.fired_at >= ?
+          AND s.fired_at <= ?
+          AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.signal_id = s.id)
+        """,
+        (cutoff_30d, grace_period),
+    )
+    rows = await cursor.fetchall()
+    count = 0
+    for signal_id, strategy, fired_at in rows:
+        detail = f"signal_id={signal_id} strategy={strategy} fired_at={fired_at}"
+        if await _is_recently_logged(db, "signal_without_orders", detail):
+            continue
+        await _log_discrepancy(
+            db,
+            platform="internal",
+            check_type="signal_without_orders",
+            local_value=1.0,
+            exchange_value=0.0,
+            discrepancy=1.0,
+            status="discrepancy",
+            detail=detail,
+        )
+        count += 1
+    return count
 
 
 async def _check_closed_without_outcomes(db: aiosqlite.Connection) -> int:

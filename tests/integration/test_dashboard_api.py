@@ -378,7 +378,7 @@ class TestRiskEndpoint:
             "best_day_pnl",
             "profitable_days_pct",
             "profitable_days",
-            "total_days_with_trades_last30",
+            "total_days_with_trades_in_sample",
         ):
             assert key in data, f"Missing key: {key}"
 
@@ -390,7 +390,7 @@ class TestRiskEndpoint:
         assert data["best_day_pnl"] == 0.0
         assert data["profitable_days_pct"] == 0.0
         assert data["profitable_days"] == 0
-        assert data["total_days_with_trades_last30"] == 0
+        assert data["total_days_with_trades_in_sample"] == 0
 
 
 # ── /api/fees ───────────────────────────────────────────────────────────────────────────────────────────
