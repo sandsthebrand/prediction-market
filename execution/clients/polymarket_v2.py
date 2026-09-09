@@ -1,17 +1,15 @@
 """Polymarket CLOB V2 execution client."""
 from __future__ import annotations
-import asyncio, logging, os, time
+import asyncio,logging,os,time
 import aiosqlite
 from core.secrets import get_secret
-from execution.clients.base import BaseExecutionClient, OrderResult
+from execution.clients.base import BaseExecutionClient,OrderResult
 from execution.clients.polymarket_book import BookResolver
 from execution.enums import Side
-from execution.models import OrderLeg
 logger=logging.getLogger(__name__)
-
 class PolymarketExecutionClientV2(BaseExecutionClient):
     def __init__(self,db_connection:aiosqlite.Connection,private_key=None,funder=None,chain_id=137):
-        super().__init__(db_connection,platform_label="polymarket"); self._book_resolver=BookResolver(db_connection); self.private_key=private_key or get_secret("POLYMARKET_PRIVATE_KEY","") or ""; self.funder=funder or get_secret("POLYMARKET_WALLET_ADDRESS","") or ""; self.chain_id=chain_id; self.host=os.getenv("POLYMARKET_API_BASE","https://clob.polymarket.com"); self.signature_type=int(os.getenv("POLYMARKET_SIGNATURE_TYPE","0")); self._client=None; self._initialized=False
+        super().__init__(db_connection,platform_label="polymarket"); self._book_resolver=BookResolver(db_connection); self.private_key=private_key or get_secret("POLYMARKET_PRIVATE_KEY","") or ""; self.funder=funder or get_secret("POLYMARKET_WALLET_ADDRESS","") or ""; self.chain_id=chain_id; self.host=os.getenv("POLYMARKET_API_BASE","https://clob.polymarket.com"); self.signature_type=int(os.getenv("POLYMARKET_SIGNATURE_TYPE","0")); self._client=None; self._initialized=False; self._translated_orders={}
     def _ensure_client(self):
         if self._initialized:return
         from py_clob_client_v2 import ApiCreds,ClobClient
@@ -29,7 +27,8 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
         try:
             resolved=await self._book_resolver.resolve(leg.market_id,leg.side,leg.size,leg.limit_price)
             if resolved is None:raise ValueError("BookResolver rejected order")
-            self._ensure_client(); from py_clob_client_v2 import OrderArgs,OrderType,PartialCreateOrderOptions,Side as PolySide
+            self._ensure_client(); self._translated_orders[str(leg.market_id)]=resolved.translated
+            from py_clob_client_v2 import OrderArgs,OrderType,PartialCreateOrderOptions,Side as PolySide
             side=PolySide.BUY if resolved.side is Side.BUY else PolySide.SELL; tick=await self._call(self._client.get_tick_size,resolved.token_id)
             response=await self._call(self._client.create_and_post_order,OrderArgs(token_id=resolved.token_id,price=resolved.limit_price,side=side,size=resolved.size),PartialCreateOrderOptions(tick_size=str(tick)),OrderType.GTC)
             oid=response.get("orderID") or response.get("order_id") or response.get("id")
@@ -40,8 +39,7 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
     async def _poll(self,oid,leg,start,max_polls=40):
         for _ in range(max_polls):
             await asyncio.sleep(.25); order=await self._call(self._client.get_order,oid); status=str(order.get("status","")).upper(); matched=float(order.get("size_matched",order.get("sizeMatched",0)) or 0)
-            if matched>0 and status in {"LIVE","DELAYED"}:
-                await self.cancel_order(oid); status="CANCELLED"
+            if matched>0 and status in {"LIVE","DELAYED"}: await self.cancel_order(oid); status="CANCELLED"
             if status in {"MATCHED","UNMATCHED","CANCELED","CANCELLED"}:
                 if matched>0:
                     price=float(order.get("price",leg.limit_price or 0)); fee=await self._estimate_fee(leg.market_id,price,matched); result=OrderResult(order_id=oid,platform="polymarket",status="filled" if matched>=leg.size else "partially_filled",submission_latency_ms=int((time.time()-start)*1000),fill_latency_ms=int((time.time()-start)*1000),filled_price=price,filled_size=matched,fee_paid=fee); await self.update_order_fill(result); await self.write_fill_event(result); return result
@@ -51,6 +49,8 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
         try:
             info=await self._call(self._client.get_clob_market_info,condition_id); rate=float((info.get("fd") or {}).get("r",0.0)); return round(size*rate*price*(1.0-price),5)
         except Exception:return 0.0
+    def economic_fill_price(self,order_id,price):
+        return 1.0-float(price) if self._translated_orders.get(str(order_id),False) else float(price)
     async def cancel_order(self,oid):
         try:
             from py_clob_client_v2 import OrderPayload
