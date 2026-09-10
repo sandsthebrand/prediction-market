@@ -29,6 +29,7 @@ jobs:
           tests/unit/test_arb_execution.py
           tests/unit/test_arb_profitability.py
           tests/unit/test_phase1_preflight.py
+          tests/unit/test_exchange_reconciliation.py
       - run: >-
           python -m mypy
           core/engine/arb_depth.py
