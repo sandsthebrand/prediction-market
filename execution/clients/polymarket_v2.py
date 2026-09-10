@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 
@@ -67,7 +68,7 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
         return await asyncio.to_thread(fn, *args, **kwargs)
 
     async def get_pretrade_fee_rate(self, leg):
-        """Return the authoritative per-market taker fee rate for a leg."""
+        """Return the fee rate normalized to the engine's quadratic price term."""
         resolved = await self._book_resolver.resolve(
             leg.market_id, leg.side, leg.size, leg.limit_price
         )
@@ -81,9 +82,16 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
                 f"Polymarket fee metadata missing for market {leg.market_id}"
             )
         rate = float(fd["r"])
+        exponent = float(fd.get("e", 1.0) or 1.0)
+        price = float(leg.limit_price)
         if rate < 0 or rate > 1:
             raise ValueError(f"invalid Polymarket fee rate: {rate}")
-        return rate
+        if not 0 <= exponent <= 8:
+            raise ValueError(f"invalid Polymarket fee exponent: {exponent}")
+        if not 0 < price < 1:
+            raise ValueError(f"invalid Polymarket fee price: {price}")
+        price_term = price * (1.0 - price)
+        return rate * price_term ** (exponent - 1.0)
 
     async def submit_order(self, leg, signal_id=None, strategy=None):
         start = time.time()
@@ -218,10 +226,14 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
         if not fd or fd.get("r") is None:
             raise ValueError("fee metadata missing")
         rate = float(fd["r"])
-        exponent = int(fd.get("e", 2) or 2)
-        raw = size * rate * price * (1.0 - price)
-        scale = 10**exponent
-        return -(-raw * scale // 1) / scale
+        exponent = float(fd.get("e", 1.0) or 1.0)
+        if rate < 0 or rate > 1:
+            raise ValueError(f"invalid Polymarket fee rate: {rate}")
+        if not 0 <= exponent <= 8:
+            raise ValueError(f"invalid Polymarket fee exponent: {exponent}")
+        raw = size * rate * (price * (1.0 - price)) ** exponent
+        scale = 10000.0
+        return math.ceil(raw * scale) / scale
 
     async def list_open_orders(self) -> list[dict]:
         """Return the complete authenticated Polymarket open-order set."""
