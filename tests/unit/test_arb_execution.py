@@ -119,7 +119,7 @@ async def test_zero_zero_is_no_fill():
 
 
 @pytest.mark.asyncio
-async def test_submission_exception_halts():
+async def test_submission_exception_halts_and_captures_other_leg():
     halted = []
 
     async def on_halt(reason):
@@ -140,6 +140,70 @@ async def test_submission_exception_halts():
 
     assert outcome.outcome is ArbOutcome.SUBMISSION_ERROR
     assert halted
+    assert outcome.buy_result is None
+    assert outcome.sell_result is not None
+    assert outcome.sell_result.filled_size == 100
+
+
+@pytest.mark.asyncio
+async def test_persistent_halt_rejects_before_any_submission():
+    buy = FakeClient(result("buy"))
+    sell = FakeClient(result("sell"))
+
+    async def is_halted():
+        return True
+
+    engine = ArbExecutionEngine(
+        max_unhedged_exposure_usd=100,
+        is_halted=is_halted,
+    )
+
+    outcome = await engine.execute(
+        buy_client=buy,
+        sell_client=sell,
+        buy_leg=leg(Side.BUY),
+        sell_leg=leg(Side.SELL),
+        signal_id="s",
+        strategy="P1",
+    )
+
+    assert outcome.outcome is ArbOutcome.REJECTED_PRE_TRADE
+    assert "halt" in outcome.detail.lower()
+    assert buy.submitted == []
+    assert sell.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_halt_state_check_failure_fails_closed_and_halts():
+    halted = []
+
+    async def is_halted():
+        raise RuntimeError("db unavailable")
+
+    async def on_halt(reason):
+        halted.append(reason)
+
+    engine = ArbExecutionEngine(
+        max_unhedged_exposure_usd=100,
+        is_halted=is_halted,
+        on_halt=on_halt,
+    )
+    buy = FakeClient(result("buy"))
+    sell = FakeClient(result("sell"))
+
+    outcome = await engine.execute(
+        buy_client=buy,
+        sell_client=sell,
+        buy_leg=leg(Side.BUY),
+        sell_leg=leg(Side.SELL),
+        signal_id="s",
+        strategy="P1",
+    )
+
+    assert outcome.outcome is ArbOutcome.SUBMISSION_ERROR
+    assert halted
+    assert buy.submitted == []
+    assert sell.submitted == []
 
 
 def test_invalid_price_fails_closed():
@@ -160,8 +224,6 @@ async def test_partial_flatten_halts_and_reports_failure():
     async def on_halt(reason):
         halted.append(reason)
 
-    # The sell client is used for the excess in this scenario. Its first
-    # submission is the 100-contract fill; the flatten call returns only 10.
     class PartialFlattenClient(FakeClient):
         def __init__(self):
             super().__init__(result("sell", size=100, price=0.45))
