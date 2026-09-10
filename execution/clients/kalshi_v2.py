@@ -239,11 +239,11 @@ class KalshiExecutionClientV2(BaseExecutionClient):
         )
 
     async def list_open_orders(self) -> list[dict]:
-        """Return all currently open Kalshi orders."""
+        """Return all currently resting Kalshi orders."""
         orders: list[dict] = []
         cursor = None
         while True:
-            query = "?limit=200"
+            query = "?status=resting&limit=200"
             if cursor:
                 query += f"&cursor={cursor}"
             payload = await self._get_json(f"/portfolio/orders{query}")
