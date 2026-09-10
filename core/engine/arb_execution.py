@@ -22,6 +22,7 @@ class ArbOutcome(str, Enum):
     UNBALANCED_FLATTENED = "unbalanced_flattened"
     FLATTEN_FAILED = "flatten_failed"
     SUBMISSION_ERROR = "submission_error"
+    FEE_UNVERIFIED = "fee_unverified"
 
 
 @dataclass
@@ -56,6 +57,7 @@ class ArbExecutionResult:
             ArbOutcome.UNBALANCED_FLATTENED,
             ArbOutcome.FLATTEN_FAILED,
             ArbOutcome.SUBMISSION_ERROR,
+            ArbOutcome.FEE_UNVERIFIED,
         }
 
 
@@ -97,6 +99,7 @@ class ArbExecutionEngine:
         flatten_order_type="LIMIT",
         fill_tolerance=1e-9,
         on_halt: Callable[[str], Awaitable[None]] | None = None,
+        is_halted: Callable[[], Awaitable[bool]] | None = None,
     ):
         if max_unhedged_exposure_usd <= 0:
             raise ValueError("max_unhedged_exposure_usd must be > 0")
@@ -106,11 +109,30 @@ class ArbExecutionEngine:
         self.flatten_order_type = "LIMIT"
         self.fill_tolerance = fill_tolerance
         self._on_halt = on_halt
+        self._is_halted = is_halted
 
     async def execute(
         self, *, buy_client, sell_client, buy_leg, sell_leg, signal_id, strategy
     ):
         started = time.monotonic()
+        if self._is_halted is not None:
+            try:
+                if await self._is_halted():
+                    return self._result(
+                        ArbOutcome.REJECTED_PRE_TRADE,
+                        buy_leg.size,
+                        started,
+                        "persistent execution halt is active",
+                    )
+            except Exception as exc:
+                await self._halt(f"halt-state check failed before execution: {exc}")
+                return self._result(
+                    ArbOutcome.SUBMISSION_ERROR,
+                    buy_leg.size,
+                    started,
+                    f"halt-state check failed: {exc}",
+                )
+
         exposure = compute_worst_case_exposure(buy_leg, sell_leg)
         if exposure is None:
             return self._result(
@@ -129,26 +151,36 @@ class ArbExecutionEngine:
                     f"${self.max_unhedged_exposure_usd:.4f}"
                 ),
             )
-        try:
-            buy_result, sell_result = await asyncio.gather(
-                buy_client.submit_order(
-                    buy_leg, signal_id=signal_id, strategy=strategy
-                ),
-                sell_client.submit_order(
-                    sell_leg, signal_id=signal_id, strategy=strategy
-                ),
-                return_exceptions=False,
-            )
-        except Exception as exc:  # noqa: BLE001 - unknown exchange state must halt
+
+        results = await asyncio.gather(
+            buy_client.submit_order(
+                buy_leg, signal_id=signal_id, strategy=strategy
+            ),
+            sell_client.submit_order(
+                sell_leg, signal_id=signal_id, strategy=strategy
+            ),
+            return_exceptions=True,
+        )
+        buy_result = results[0] if isinstance(results[0], OrderResult) else None
+        sell_result = results[1] if isinstance(results[1], OrderResult) else None
+        exceptions = [result for result in results if isinstance(result, Exception)]
+        if exceptions:
+            detail = "; ".join(str(exc) for exc in exceptions)
+            await self._cancel_remainder(buy_client, buy_result)
+            await self._cancel_remainder(sell_client, sell_result)
             await self._halt(
-                f"arb leg submission exception; exchange state unknown: {exc}"
+                f"arb leg submission exception; all leg outcomes observed; "
+                f"exchange state requires reconciliation: {detail}"
             )
             return self._result(
                 ArbOutcome.SUBMISSION_ERROR,
                 buy_leg.size,
                 started,
-                f"submission exception: {exc}",
+                f"submission exception: {detail}",
+                buy_result,
+                sell_result,
             )
+
         buy_filled, sell_filled = _filled_size(buy_result), _filled_size(sell_result)
         matched = min(buy_filled, sell_filled)
         imbalance = abs(buy_filled - sell_filled)
@@ -164,6 +196,21 @@ class ArbExecutionEngine:
                 sell_result,
             )
         if imbalance <= self.fill_tolerance:
+            if not self._fees_verified(buy_result, sell_result):
+                await self._halt(
+                    "both arb legs filled but one or more fees are unverified; "
+                    "halt until fee reconciliation"
+                )
+                return self._result(
+                    ArbOutcome.FEE_UNVERIFIED,
+                    buy_leg.size,
+                    started,
+                    "both legs filled but fee verification is incomplete",
+                    buy_result,
+                    sell_result,
+                    matched,
+                    0.0,
+                )
             return self._result(
                 ArbOutcome.BOTH_FILLED,
                 buy_leg.size,
@@ -215,8 +262,12 @@ class ArbExecutionEngine:
             attempts,
         )
 
+    @staticmethod
+    def _fees_verified(*results):
+        return all(result is not None and result.fee_verified for result in results)
+
     async def _cancel_remainder(self, client, result):
-        if result is None or result.order_id.startswith("FAILED-"):
+        if result is None or not result.order_id or result.order_id.startswith("FAILED-"):
             return
         if result.status in {"pending", "partially_filled"}:
             try:
