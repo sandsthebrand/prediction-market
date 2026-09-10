@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import logging
 import os
@@ -78,8 +79,6 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
             order_type="LIMIT",
         )
         try:
-            import asyncio
-
             buy_depth, sell_depth = await asyncio.gather(
                 get_executable_depth(buy_client, buy_leg),
                 get_executable_depth(sell_client, sell_leg),
@@ -114,8 +113,10 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
         )
         min_edge = float(os.getenv("PHASE1_MIN_NET_EDGE", "0.005"))
         try:
-            buy_fee_rate = self._fee_rate(buy_platform)
-            sell_fee_rate = self._fee_rate(sell_platform)
+            buy_fee_rate, sell_fee_rate = await asyncio.gather(
+                self._pretrade_fee_rate(buy_client, buy_leg, buy_platform),
+                self._pretrade_fee_rate(sell_client, sell_leg, sell_platform),
+            )
             executable = calculate_executable_arb(
                 buy_price=buy_price,
                 sell_price=sell_price,
@@ -124,7 +125,7 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
                 sell_fee_rate=sell_fee_rate,
                 slippage_bps=self._risk_config.slippage_bps,
             )
-        except ValueError as exc:
+        except (RuntimeError, ValueError) as exc:
             logger.info("Phase1 fee verification rejected pair=%s: %s", pair_id, exc)
             return None
         if (
@@ -366,13 +367,14 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
         }
 
     @staticmethod
-    def _fee_rate(platform):
+    async def _pretrade_fee_rate(client, leg, platform):
+        getter = getattr(client, "get_pretrade_fee_rate", None)
+        if getter is not None:
+            return float(await getter(leg))
         key = "POLYMARKET_FEE_RATE" if platform == "polymarket" else "KALSHI_FEE_RATE"
         value = os.getenv(key, "").strip()
         if not value:
-            raise ValueError(
-                f"{key} is not configured; refusing optimistic fee estimate"
-            )
+            raise ValueError(f"{key} is not configured for paper fee estimation")
         try:
             rate = float(value)
         except ValueError as exc:
