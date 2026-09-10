@@ -1,12 +1,17 @@
 """Phase 1 hardened arbitrage engine."""
 
 from __future__ import annotations
-import copy, logging, os, uuid
+
+import copy
+import logging
+import os
+import uuid
 from datetime import datetime, timezone
+
+from core.engine.arb_depth import executable_quantity, get_executable_depth
 from core.engine.arb_engine_legacy import ArbitrageEngine as _LegacyArbitrageEngine
 from core.engine.arb_execution import ArbExecutionEngine, ArbOutcome
 from core.engine.arb_profitability import calculate_executable_arb
-from core.engine.arb_depth import executable_quantity, get_executable_depth
 from core.engine.execution_control import halt, is_halted
 from core.engine.fire_state import _RiskLeg, _RiskSignal
 from core.matching.contract_guard import verify_contract_equivalence
@@ -108,14 +113,20 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
             order_type="LIMIT",
         )
         min_edge = float(os.getenv("PHASE1_MIN_NET_EDGE", "0.005"))
-        executable = calculate_executable_arb(
-            buy_price=buy_price,
-            sell_price=sell_price,
-            quantity=size,
-            buy_fee_rate=self._fee_rate(buy_platform, buy_price),
-            sell_fee_rate=self._fee_rate(sell_platform, sell_price),
-            slippage_bps=self._risk_config.slippage_bps,
-        )
+        try:
+            buy_fee_rate = self._fee_rate(buy_platform)
+            sell_fee_rate = self._fee_rate(sell_platform)
+            executable = calculate_executable_arb(
+                buy_price=buy_price,
+                sell_price=sell_price,
+                quantity=size,
+                buy_fee_rate=buy_fee_rate,
+                sell_fee_rate=sell_fee_rate,
+                slippage_bps=self._risk_config.slippage_bps,
+            )
+        except ValueError as exc:
+            logger.info("Phase1 fee verification rejected pair=%s: %s", pair_id, exc)
+            return None
         if (
             executable is None
             or not executable.profitable
@@ -124,11 +135,30 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
             return None
         try:
             await self.db.execute(
-                "INSERT OR IGNORE INTO market_pairs (id,market_id_a,market_id_b,pair_type,similarity_score,match_method,active,verified,created_at,updated_at) VALUES (?, ?, ?, 'cross_platform', ?, 'inverted_index', 1, 1, ?, ?)",
-                (pair_id, buy_id, sell_id, match.get("similarity", 0.0), now, now),
+                """
+                INSERT OR IGNORE INTO market_pairs (
+                    id, market_id_a, market_id_b, pair_type, similarity_score,
+                    match_method, active, verified, created_at, updated_at
+                ) VALUES (?, ?, ?, 'cross_platform', ?, 'inverted_index', 1, 1, ?, ?)
+                """,
+                (
+                    pair_id,
+                    buy_id,
+                    sell_id,
+                    match.get("similarity", 0.0),
+                    now,
+                    now,
+                ),
             )
             await self.db.execute(
-                "INSERT OR IGNORE INTO violations (id,pair_id,violation_type,price_a_at_detect,price_b_at_detect,raw_spread,net_spread,fee_estimate_a,fee_estimate_b,status,detected_at,updated_at) VALUES (?, ?, 'cross_platform', ?, ?, ?, ?, ?, ?, 'detected', ?, ?)",
+                """
+                INSERT OR IGNORE INTO violations (
+                    id, pair_id, violation_type, price_a_at_detect,
+                    price_b_at_detect, raw_spread, net_spread, fee_estimate_a,
+                    fee_estimate_b, status, detected_at, updated_at
+                ) VALUES (?, ?, 'cross_platform', ?, ?, ?, ?, ?, ?,
+                          'detected', ?, ?)
+                """,
                 (
                     violation_id,
                     pair_id,
@@ -167,14 +197,23 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
         if not all_passed:
             failed = [r.check_type for r in checks if not r.passed]
             await self.db.execute(
-                "UPDATE violations SET status='risk_rejected',rejection_reason=?,updated_at=? WHERE id=?",
+                "UPDATE violations SET status='risk_rejected',"
+                "rejection_reason=?,updated_at=? WHERE id=?",
                 (", ".join(failed), now, violation_id),
             )
             await self.db.commit()
             return None
         try:
             await self.db.execute(
-                "INSERT OR IGNORE INTO signals (id,violation_id,strategy,signal_type,market_id_a,market_id_b,target_price_a,target_price_b,model_edge,kelly_fraction,position_size_a,position_size_b,total_capital_at_risk,status,fired_at,updated_at) VALUES (?, ?, ?, 'arb_pair', ?, ?, ?, ?, ?, 0, ?, ?, ?, 'fired', ?, ?)",
+                """
+                INSERT OR IGNORE INTO signals (
+                    id, violation_id, strategy, signal_type, market_id_a,
+                    market_id_b, target_price_a, target_price_b, model_edge,
+                    kelly_fraction, position_size_a, position_size_b,
+                    total_capital_at_risk, status, fired_at, updated_at
+                ) VALUES (?, ?, ?, 'arb_pair', ?, ?, ?, ?, ?, 0, ?, ?, ?,
+                          'fired', ?, ?)
+                """,
                 (
                     signal_id,
                     violation_id,
@@ -241,7 +280,14 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
         try:
             pos_id = f"pos_{uuid.uuid4().hex[:12]}"
             await self.db.execute(
-                "INSERT INTO positions (id,signal_id,market_id,strategy,side,book,entry_price,entry_size,exit_price,exit_size,realized_pnl,fees_paid,pnl_model,status,opened_at,closed_at,updated_at) VALUES (?, ?, ?, ?, 'BUY', 'YES', ?, ?, ?, ?, ?, ?, 'realistic', 'closed', ?, ?, ?)",
+                """
+                INSERT INTO positions (
+                    id, signal_id, market_id, strategy, side, book, entry_price,
+                    entry_size, exit_price, exit_size, realized_pnl, fees_paid,
+                    pnl_model, status, opened_at, closed_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'BUY', 'YES', ?, ?, ?, ?, ?, ?,
+                          'realistic', 'closed', ?, ?, ?)
+                """,
                 (
                     pos_id,
                     signal_id,
@@ -259,7 +305,14 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
                 ),
             )
             await self.db.execute(
-                "INSERT INTO trade_outcomes (id,signal_id,strategy,violation_id,market_id_a,market_id_b,predicted_edge,predicted_pnl,actual_pnl,fees_total,edge_captured_pct,signal_to_fill_ms,holding_period_ms,spread_at_signal,resolved_at,created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO trade_outcomes (
+                    id, signal_id, strategy, violation_id, market_id_a,
+                    market_id_b, predicted_edge, predicted_pnl, actual_pnl,
+                    fees_total, edge_captured_pct, signal_to_fill_ms,
+                    holding_period_ms, spread_at_signal, resolved_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     f"trade_{uuid.uuid4().hex[:12]}",
                     signal_id,
@@ -284,7 +337,8 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
                 ),
             )
             await self.db.execute(
-                "UPDATE violations SET status='executed',closed_at=?,updated_at=? WHERE id=?",
+                "UPDATE violations SET status='executed',closed_at=?,"
+                "updated_at=? WHERE id=?",
                 (now, now, violation_id),
             )
             await self.db.commit()
@@ -312,17 +366,22 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
         }
 
     @staticmethod
-    def _fee_rate(platform, price):
-        return float(
-            os.getenv(
-                (
-                    "POLYMARKET_FEE_RATE"
-                    if platform == "polymarket"
-                    else "KALSHI_FEE_RATE"
-                ),
-                "0.05" if platform == "polymarket" else "0.07",
-            )
+    def _fee_rate(platform):
+        key = (
+            "POLYMARKET_FEE_RATE"
+            if platform == "polymarket"
+            else "KALSHI_FEE_RATE"
         )
+        value = os.getenv(key, "").strip()
+        if not value:
+            raise ValueError(f"{key} is not configured; refusing optimistic fee estimate")
+        try:
+            rate = float(value)
+        except ValueError as exc:
+            raise ValueError(f"{key} must be numeric") from exc
+        if not 0 <= rate <= 1:
+            raise ValueError(f"{key} must be between 0 and 1")
+        return rate
 
     async def _record_execution_failure(self, violation_id, outcome, detail):
         try:
