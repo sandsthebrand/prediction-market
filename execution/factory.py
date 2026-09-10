@@ -30,11 +30,11 @@ def _make_execution_clients(
         from execution.clients.polymarket_v2 import PolymarketExecutionClientV2
 
         return PolymarketExecutionClientV2(db), KalshiExecutionClientV2(db)
-    from execution.clients.paper import PaperExecutionClient
+    from execution.clients.paper_phase1 import Phase1PaperExecutionClient
 
-    return PaperExecutionClient(db, platform_label="polymarket"), PaperExecutionClient(
-        db, platform_label="paper_kalshi"
-    )
+    return Phase1PaperExecutionClient(
+        db, platform_label="polymarket"
+    ), Phase1PaperExecutionClient(db, platform_label="paper_kalshi")
 
 
 def _make_single_execution_client(db, execution_mode: str, platform: str):
@@ -47,6 +47,6 @@ def _make_single_execution_client(db, execution_mode: str, platform: str):
         from execution.clients.kalshi_v2 import KalshiExecutionClientV2
 
         return KalshiExecutionClientV2(db)
-    from execution.clients.paper import PaperExecutionClient
+    from execution.clients.paper_phase1 import Phase1PaperExecutionClient
 
-    return PaperExecutionClient(db, platform_label=f"paper_{platform}")
+    return Phase1PaperExecutionClient(db, platform_label=f"paper_{platform}")
