@@ -80,13 +80,19 @@ async def _kalshi_depth(client, leg: OrderLeg) -> float | None:
 
 async def get_executable_depth(client, leg: OrderLeg) -> float | None:
     """Return quantity immediately executable within the leg's limit price."""
+    custom = getattr(client, "get_executable_depth", None)
+    if custom is not None:
+        return await custom(leg)
     label = str(
         getattr(client, "platform", getattr(client, "platform_label", ""))
     ).lower()
     if label.startswith("paper") or client.__class__.__name__.lower().startswith(
         "paper"
     ):
-        return float(leg.size)
+        # Legacy paper clients are deliberately no longer treated as having
+        # infinite/requested-size liquidity. They must implement live-book
+        # depth before being used by the Phase 1 engine.
+        return None
     if leg.platform == "polymarket":
         return await _polymarket_depth(client, leg)
     if leg.platform == "kalshi":
