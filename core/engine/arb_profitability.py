@@ -31,12 +31,24 @@ def _price_ok(price: float) -> bool:
 
 
 def _quadratic_fee(
-    quantity: float, price: float, rate: float, rounding_decimals: int = 4
+    quantity: float,
+    price: float,
+    rate: float,
+    fee_exponent: float = 1.0,
+    rounding_decimals: int = 4,
 ) -> float:
-    """Prediction-market taker fee with venue-specific upward rounding."""
+    """Calculate a prediction-market fee conservatively.
+
+    Polymarket V2 exposes ``fd.e`` as the exponent applied to the price term
+    ``price * (1 - price)``. It is not a decimal-place rounding exponent.
+    Fees are rounded upward to the configured precision so pre-trade P&L does
+    not overstate the opportunity.
+    """
+    if fee_exponent < 0 or fee_exponent > 8:
+        raise ValueError("fee_exponent must be between 0 and 8")
     if rounding_decimals < 0 or rounding_decimals > 8:
         raise ValueError("rounding_decimals must be between 0 and 8")
-    raw = quantity * rate * price * (1.0 - price)
+    raw = quantity * rate * (price * (1.0 - price)) ** fee_exponent
     scale = 10**rounding_decimals
     return math.ceil(raw * scale) / scale
 
@@ -50,6 +62,8 @@ def calculate_executable_arb(
     sell_fee_rate: float,
     slippage_bps: float = 0.0,
     extra_cost: float = 0.0,
+    buy_fee_exponent: float = 1.0,
+    sell_fee_exponent: float = 1.0,
     buy_fee_decimals: int = 4,
     sell_fee_decimals: int = 4,
 ) -> ExecutableArb | None:
@@ -70,10 +84,18 @@ def calculate_executable_arb(
     effective_sell = max(0.000001, sell_price * (1.0 - slip))
     gross = (effective_sell - effective_buy) * quantity
     buy_fee = _quadratic_fee(
-        quantity, effective_buy, buy_fee_rate, buy_fee_decimals
+        quantity,
+        effective_buy,
+        buy_fee_rate,
+        buy_fee_exponent,
+        buy_fee_decimals,
     )
     sell_fee = _quadratic_fee(
-        quantity, effective_sell, sell_fee_rate, sell_fee_decimals
+        quantity,
+        effective_sell,
+        sell_fee_rate,
+        sell_fee_exponent,
+        sell_fee_decimals,
     )
     net = gross - buy_fee - sell_fee - extra_cost
 
