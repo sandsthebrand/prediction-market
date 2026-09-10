@@ -223,6 +223,40 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
         scale = 10**exponent
         return -(-raw * scale // 1) / scale
 
+    async def list_open_orders(self) -> list[dict]:
+        """Return the complete authenticated Polymarket open-order set."""
+        self._ensure_client()
+        orders = await self._call(self._client.get_open_orders)
+        if not isinstance(orders, list):
+            raise RuntimeError("Polymarket open-orders response was not a list")
+        return [dict(order) for order in orders]
+
+    async def list_recent_fills(self, since: int | None = None) -> list[dict]:
+        """Return authenticated Polymarket user trades.
+
+        The SDK paginates by cursor and accepts an ``after`` timestamp.  We
+        deliberately request the full available window when ``since`` is not
+        supplied; reconciliation callers should provide their last-known
+        timestamp to bound the query during normal operation.
+        """
+        self._ensure_client()
+        from py_clob_client_v2 import TradeParams
+
+        params = TradeParams(after=int(since)) if since is not None else None
+        trades = await self._call(self._client.get_trades, params)
+        if not isinstance(trades, list):
+            raise RuntimeError("Polymarket trades response was not a list")
+        return [dict(trade) for trade in trades]
+
+    async def get_exchange_positions(self) -> list[dict]:
+        """Positions are reconciled from the CLOB fills in Phase 1.
+
+        Polymarket's CLOB client exposes orders/trades but not a canonical
+        position endpoint. Returning an explicit unsupported error prevents
+        an unavailable position feed from being mistaken for zero exposure.
+        """
+        raise NotImplementedError("Polymarket position reconciliation requires Data API")
+
     def economic_fill_price(self, order_id, price):
         return (
             1.0 - float(price)
