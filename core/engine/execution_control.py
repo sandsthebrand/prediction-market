@@ -34,6 +34,47 @@ async def halt(db: aiosqlite.Connection, reason: str) -> None:
     logger.critical("PHASE1 EXECUTION HALTED: %s", reason)
 
 
+async def halt_and_cancel(
+    db: aiosqlite.Connection, clients: dict[str, object], reason: str
+) -> None:
+    """Persist the halt and make a best-effort cancellation of all open orders.
+
+    The halt is committed first. Cancellation failures never clear the halt;
+    reconciliation remains responsible for detecting any residual exchange
+    state before trading can resume.
+    """
+    await halt(db, reason)
+    for platform, client in clients.items():
+        try:
+            open_orders = await client.list_open_orders()
+        except Exception as exc:
+            logger.exception(
+                "Could not enumerate %s open orders while halted: %s", platform, exc
+            )
+            continue
+        for order in open_orders:
+            order_id = (
+                order.get("order_id") or order.get("orderID") or order.get("id")
+            )
+            if not order_id:
+                logger.error("%s open order missing order id during halt", platform)
+                continue
+            try:
+                cancelled = await client.cancel_order(str(order_id))
+                if not cancelled:
+                    logger.error(
+                        "Failed to cancel %s open order %s during halt",
+                        platform,
+                        order_id,
+                    )
+            except Exception:
+                logger.exception(
+                    "Exception cancelling %s order %s during halt",
+                    platform,
+                    order_id,
+                )
+
+
 async def clear_halt(
     db: aiosqlite.Connection, reason: str = "operator re-armed"
 ) -> None:
