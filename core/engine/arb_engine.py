@@ -15,6 +15,7 @@ from core.engine.arb_execution import ArbExecutionEngine, ArbOutcome
 from core.engine.arb_profitability import calculate_executable_arb
 from core.engine.execution_control import halt, is_halted
 from core.engine.fire_state import _RiskLeg, _RiskSignal
+from core.engine.reconciliation import reconcile_exchange_state
 from core.matching.contract_guard import verify_contract_equivalence
 from execution.enums import Side
 from execution.models import OrderLeg
@@ -23,8 +24,28 @@ logger = logging.getLogger(__name__)
 
 
 class ArbitrageEngine(_LegacyArbitrageEngine):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._exchange_reconciled = False
+
     async def _execute_arb_trade(self, match, p_price, k_price, spread, pair_id):
         from core.signals.risk import get_portfolio_value, run_all_checks
+
+        if os.getenv("EXECUTION_MODE", "paper").lower() == "live" and not self._exchange_reconciled:
+            reconciliation = await reconcile_exchange_state(
+                self.db,
+                {
+                    "polymarket": self._poly_client,
+                    "kalshi": self._kalshi_client,
+                },
+            )
+            if not reconciliation.get("clean", False):
+                logger.critical(
+                    "Phase1 live execution blocked by exchange reconciliation: %s",
+                    reconciliation,
+                )
+                return None
+            self._exchange_reconciled = True
 
         if await is_halted(self.db) or not (0 < p_price < 1 and 0 < k_price < 1):
             return None
