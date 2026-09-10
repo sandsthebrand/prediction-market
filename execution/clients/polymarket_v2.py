@@ -42,14 +42,22 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
 
         if not self.private_key:
             raise ValueError("POLYMARKET_PRIVATE_KEY is required")
-        kwargs = {"host": self.host, "chain_id": self.chain_id, "key": self.private_key}
+        kwargs = {
+            "host": self.host,
+            "chain_id": self.chain_id,
+            "key": self.private_key,
+        }
         if self.funder:
             kwargs.update(funder=self.funder, signature_type=self.signature_type)
         ak = get_secret("POLYMARKET_API_KEY", "") or ""
         sec = get_secret("POLYMARKET_API_SECRET", "") or ""
         pp = get_secret("POLYMARKET_API_PASSPHRASE", "") or ""
         if ak and sec and pp:
-            kwargs["creds"] = ApiCreds(api_key=ak, api_secret=sec, api_passphrase=pp)
+            kwargs["creds"] = ApiCreds(
+                api_key=ak,
+                api_secret=sec,
+                api_passphrase=pp,
+            )
         self._client = ClobClient(**kwargs)
         if "creds" not in kwargs:
             self._client.set_api_creds(self._client.create_or_derive_api_key())
@@ -57,6 +65,25 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
 
     async def _call(self, fn, *args, **kwargs):
         return await asyncio.to_thread(fn, *args, **kwargs)
+
+    async def get_pretrade_fee_rate(self, leg):
+        """Return the authoritative per-market taker fee rate for a leg."""
+        resolved = await self._book_resolver.resolve(
+            leg.market_id, leg.side, leg.size, leg.limit_price
+        )
+        if resolved is None:
+            raise ValueError("BookResolver rejected fee lookup")
+        self._ensure_client()
+        info = await self._call(self._client.get_clob_market_info, leg.market_id)
+        fd = info.get("fd")
+        if not fd or fd.get("r") is None:
+            raise ValueError(
+                f"Polymarket fee metadata missing for market {leg.market_id}"
+            )
+        rate = float(fd["r"])
+        if rate < 0 or rate > 1:
+            raise ValueError(f"invalid Polymarket fee rate: {rate}")
+        return rate
 
     async def submit_order(self, leg, signal_id=None, strategy=None):
         start = time.time()
@@ -124,7 +151,9 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
             await asyncio.sleep(0.25)
             order = await self._call(self._client.get_order, oid)
             status = str(order.get("status", "")).upper()
-            matched = float(order.get("size_matched", order.get("sizeMatched", 0)) or 0)
+            matched = float(
+                order.get("size_matched", order.get("sizeMatched", 0)) or 0
+            )
             if matched > 0 and status in {"LIVE", "DELAYED"}:
                 await self.cancel_order(oid)
                 status = "CANCELLED"
@@ -166,8 +195,10 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
     async def _estimate_fee(self, condition_id, price, size):
         try:
             info = await self._call(self._client.get_clob_market_info, condition_id)
-            fd = info.get("fd") or {}
-            rate = float(fd.get("r", 0.0))
+            fd = info.get("fd")
+            if not fd or fd.get("r") is None:
+                raise ValueError("fee metadata missing")
+            rate = float(fd["r"])
             exponent = int(fd.get("e", 2) or 2)
             raw = size * rate * price * (1.0 - price)
             scale = 10**exponent
