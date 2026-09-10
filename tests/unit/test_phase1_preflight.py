@@ -33,6 +33,7 @@ class FakeHttp:
 async def test_kalshi_fee_uses_event_override_and_series_multiplier(monkeypatch):
     client = KalshiExecutionClientV2(None, api_key="k", rsa_key_path="")
     client._private_key = object()
+    client._sign = lambda method, path: {}
     client._fee_cache.clear()
     fake = FakeHttp(
         {
@@ -59,9 +60,10 @@ async def test_kalshi_fee_uses_event_override_and_series_multiplier(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_kalshi_fee_rejects_flat_schedule(monkeypatch):
+async def test_kalshi_fee_rejects_flat_schedule():
     client = KalshiExecutionClientV2(None, api_key="k", rsa_key_path="")
     client._private_key = object()
+    client._sign = lambda method, path: {}
     client.http_client = FakeHttp(
         {
             "/markets/MKT": {"market": {"event_ticker": "EVT"}},
