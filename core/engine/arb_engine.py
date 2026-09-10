@@ -92,7 +92,7 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
         size = executable_quantity(buy_depth, sell_depth, requested)
         if size is None:
             return None
-        size = round(size, 1)
+        size = round(size, 2)
         if size <= 0:
             return None
         buy_leg = OrderLeg(
@@ -112,6 +112,14 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
             order_type="LIMIT",
         )
         min_edge = float(os.getenv("PHASE1_MIN_NET_EDGE", "0.005"))
+        flatten_risk_bps = float(os.getenv("PHASE1_FLATTEN_RISK_BPS", "0"))
+        if flatten_risk_bps < 0:
+            raise ValueError("PHASE1_FLATTEN_RISK_BPS must be non-negative")
+        max_unhedged = min(
+            bankroll * self._risk_config.max_position_pct,
+            bankroll * self._risk_config.max_portfolio_exposure_pct,
+        )
+        extra_cost = max_unhedged * flatten_risk_bps / 10000.0
         try:
             buy_fee_rate, sell_fee_rate = await asyncio.gather(
                 self._pretrade_fee_rate(buy_client, buy_leg, buy_platform),
@@ -124,6 +132,7 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
                 buy_fee_rate=buy_fee_rate,
                 sell_fee_rate=sell_fee_rate,
                 slippage_bps=self._risk_config.slippage_bps,
+                extra_cost=extra_cost,
             )
         except (RuntimeError, ValueError) as exc:
             logger.info("Phase1 fee verification rejected pair=%s: %s", pair_id, exc)
@@ -204,6 +213,24 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
             )
             await self.db.commit()
             return None
+
+        # Re-run the equivalence guard immediately before routing orders. Pair
+        # discovery can be stale and market metadata/rules can change between
+        # discovery, depth/fee checks, and execution.
+        equivalent, reason = await verify_contract_equivalence(
+            self.db, match["poly_id"], match["kalshi_id"]
+        )
+        if not equivalent:
+            await self.db.execute(
+                "UPDATE violations SET status='contract_rejected',"
+                "rejection_reason=?,updated_at=? WHERE id=?",
+                (f"trade-time contract guard: {reason}", now, violation_id),
+            )
+            await self.db.commit()
+            return None
+        if await is_halted(self.db):
+            return None
+
         try:
             await self.db.execute(
                 """
@@ -235,13 +262,10 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
         except Exception:
             logger.exception("Phase1 signal persistence failed; no order sent")
             return None
-        max_unhedged = min(
-            bankroll * self._risk_config.max_position_pct,
-            bankroll * self._risk_config.max_portfolio_exposure_pct,
-        )
         execution = await ArbExecutionEngine(
             max_unhedged_exposure_usd=max_unhedged,
             on_halt=lambda reason: halt(self.db, reason),
+            is_halted=lambda: is_halted(self.db),
         ).execute(
             buy_client=buy_client,
             sell_client=sell_client,
