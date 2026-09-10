@@ -1,13 +1,18 @@
 """Execution client factory."""
 
-import logging, os
+import logging
+import os
+
 from execution.clients.base import BaseExecutionClient
 
 logger = logging.getLogger(__name__)
 
 
 def _assert_phase1_live_preflight():
-    required = {"PHASE1_FEES_VERIFIED": "true", "PHASE1_API_V2_VERIFIED": "true"}
+    required = {
+        "PHASE1_FEES_VERIFIED": "true",
+        "PHASE1_API_V2_VERIFIED": "true",
+    }
     missing = [k for k, v in required.items() if os.getenv(k, "").lower() != v]
     if missing:
         raise RuntimeError(
