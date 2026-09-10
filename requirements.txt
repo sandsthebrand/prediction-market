@@ -29,7 +29,7 @@ scikit-learn>=1.4.0
 cryptography>=42.0.0
 
 # Polymarket CLOB V2 — legacy py-clob-client is archived and unsupported
-py_clob_client_v2==1.0.1
+py_clob_client_v2==1.0.2
 
 # Testing
 pytest>=8.0.0
