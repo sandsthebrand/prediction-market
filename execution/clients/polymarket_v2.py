@@ -66,8 +66,8 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
     async def _call(self, fn, *args, **kwargs):
         return await asyncio.to_thread(fn, *args, **kwargs)
 
-    async def get_pretrade_fee_rate(self, leg):
-        """Return the authoritative per-market taker fee rate for a leg."""
+    async def get_pretrade_fee_terms(self, leg):
+        """Return (taker rate, fee rounding decimals) for this market."""
         resolved = await self._book_resolver.resolve(
             leg.market_id, leg.side, leg.size, leg.limit_price
         )
@@ -81,8 +81,15 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
                 f"Polymarket fee metadata missing for market {leg.market_id}"
             )
         rate = float(fd["r"])
+        exponent = int(fd.get("e", 4) or 4)
         if rate < 0 or rate > 1:
             raise ValueError(f"invalid Polymarket fee rate: {rate}")
+        if exponent < 0 or exponent > 8:
+            raise ValueError(f"invalid Polymarket fee exponent: {exponent}")
+        return rate, exponent
+
+    async def get_pretrade_fee_rate(self, leg):
+        rate, _ = await self.get_pretrade_fee_terms(leg)
         return rate
 
     async def submit_order(self, leg, signal_id=None, strategy=None):
@@ -169,8 +176,6 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
                         fee = await self._estimate_fee(leg.market_id, price, matched)
                         fee_verified = True
                     except Exception as exc:
-                        # A confirmed fill is exchange truth. Fee verification is
-                        # secondary and must never downgrade the fill to failed.
                         fee_error = str(exc)
                         logger.error(
                             "Polymarket fill %s confirmed but fee is unverified: %s",
