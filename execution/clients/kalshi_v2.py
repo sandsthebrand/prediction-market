@@ -238,6 +238,57 @@ class KalshiExecutionClientV2(BaseExecutionClient):
             fee_verified=False,
         )
 
+    async def list_open_orders(self) -> list[dict]:
+        """Return all currently open Kalshi orders."""
+        orders: list[dict] = []
+        cursor = None
+        while True:
+            query = "?limit=200"
+            if cursor:
+                query += f"&cursor={cursor}"
+            payload = await self._get_json(f"/portfolio/orders{query}")
+            page = payload.get("orders") or []
+            orders.extend(dict(order) for order in page)
+            cursor = payload.get("cursor")
+            if not cursor or not page:
+                break
+        return orders
+
+    async def list_recent_fills(self, since: int | None = None) -> list[dict]:
+        """Return authenticated Kalshi fills, optionally bounded by timestamp."""
+        fills: list[dict] = []
+        cursor = None
+        while True:
+            query = "?limit=200"
+            if cursor:
+                query += f"&cursor={cursor}"
+            payload = await self._get_json(f"/portfolio/fills{query}")
+            page = payload.get("fills") or []
+            for fill in page:
+                if since is None:
+                    fills.append(dict(fill))
+                    continue
+                ts = fill.get("created_time") or fill.get("timestamp")
+                try:
+                    if ts is None or float(ts) >= float(since):
+                        fills.append(dict(fill))
+                except (TypeError, ValueError):
+                    fills.append(dict(fill))
+            cursor = payload.get("cursor")
+            if not cursor or not page:
+                break
+        return fills
+
+    async def get_exchange_positions(self) -> list[dict]:
+        """Return current Kalshi positions."""
+        payload = await self._get_json("/portfolio/positions?limit=200")
+        positions = payload.get("market_positions")
+        if positions is None:
+            positions = payload.get("positions")
+        if positions is None:
+            raise RuntimeError("Kalshi positions response missing positions field")
+        return [dict(position) for position in positions]
+
     async def cancel_order(self, oid):
         await self._limit()
         path = f"/trade-api/v2/portfolio/events/orders/{oid}"
