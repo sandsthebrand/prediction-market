@@ -35,9 +35,20 @@ class Phase1PaperExecutionClient(PaperExecutionClient):
             if rate is None:
                 raise ValueError(f"Polymarket fee metadata missing for {market_id}")
             rate = float(rate)
+            exponent = float(fd.get("e", 1.0) or 1.0)
+            price = float(leg.limit_price)
             if not 0 <= rate <= 1:
                 raise ValueError(f"invalid Polymarket fee rate: {rate}")
-            return rate
+            if not 0 <= exponent <= 8:
+                raise ValueError(f"invalid Polymarket fee exponent: {exponent}")
+            if not 0 < price < 1:
+                raise ValueError(f"invalid Polymarket fee price: {price}")
+            # The profitability engine models fees as rate * p * (1-p).
+            # Convert the venue's fd.r/fd.e term to an equivalent rate at
+            # this executable price so the engine does not need venue-specific
+            # fee semantics.
+            price_term = price * (1.0 - price)
+            return rate * price_term ** (exponent - 1.0)
 
         if leg.platform == "kalshi":
             base = os.getenv(
