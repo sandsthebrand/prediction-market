@@ -142,20 +142,12 @@ class KalshiExecutionClientV2(BaseExecutionClient):
                 continue
             order = response.json().get("order", response.json())
             status = str(order.get("status", "")).lower()
-            matched = float(
-                order.get("fill_count_fp", order.get("fill_count", 0)) or 0
-            )
+            matched = float(order.get("fill_count_fp", order.get("fill_count", 0)) or 0)
             if status in {"executed", "filled", "canceled", "cancelled"}:
                 if matched > 0:
-                    price = float(
-                        order.get("yes_price_dollars", leg.limit_price)
-                    )
-                    taker_fee = float(
-                        order.get("taker_fees_dollars", 0) or 0
-                    )
-                    maker_fee = float(
-                        order.get("maker_fees_dollars", 0) or 0
-                    )
+                    price = float(order.get("yes_price_dollars", leg.limit_price))
+                    taker_fee = float(order.get("taker_fees_dollars", 0) or 0)
+                    maker_fee = float(order.get("maker_fees_dollars", 0) or 0)
                     fee = taker_fee + maker_fee
                     result = OrderResult(
                         order_id=oid,
