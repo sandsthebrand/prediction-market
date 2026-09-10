@@ -45,3 +45,28 @@ def test_slippage_is_included():
     )
     assert no_slip and slip
     assert slip.net_profit < no_slip.net_profit
+
+
+def test_fee_exponent_changes_price_curve_not_rounding_precision():
+    linear = calculate_executable_arb(
+        buy_price=0.25,
+        sell_price=0.50,
+        quantity=10,
+        buy_fee_rate=0.10,
+        sell_fee_rate=0.0,
+        buy_fee_exponent=1.0,
+        buy_fee_decimals=4,
+    )
+    squared = calculate_executable_arb(
+        buy_price=0.25,
+        sell_price=0.50,
+        quantity=10,
+        buy_fee_rate=0.10,
+        sell_fee_rate=0.0,
+        buy_fee_exponent=2.0,
+        buy_fee_decimals=4,
+    )
+    assert linear is not None and squared is not None
+    assert linear.buy_fee > squared.buy_fee
+    assert linear.buy_fee == 0.1875
+    assert squared.buy_fee == 0.0352
