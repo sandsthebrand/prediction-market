@@ -71,8 +71,6 @@ class BaseExecutionClient:
     async def close(self) -> None:
         """Clean up resources. Override if needed."""
 
-    # ── Shared DB writes ────────────────────────────────────────────────────────────────────
-
     async def write_order(
         self,
         leg: OrderLeg,
@@ -81,23 +79,13 @@ class BaseExecutionClient:
         strategy: str | None = None,
         resolved: "ResolvedOrder | None" = None,
     ) -> None:
-        """
-        Write an order record to the orders table.
-
-        When ``resolved`` is provided, ``side``, ``requested_price``, and
-        ``book`` are pulled from it — reflecting what actually hit the
-        exchange rather than the strategy's original intent. Callers that
-        don't route through a resolver (Kalshi, paper-Kalshi) pass None
-        and rows get book='YES' via the column default.
-        """
+        """Write an order record; DB failure is fatal to the execution path."""
         now = int(time.time())
-        requested_price: float | None
         if resolved is not None:
             side_str = resolved.side.value
             requested_price = resolved.limit_price
             book_str = resolved.book.value
         else:
-            # Normalize to uppercase for consistency with new enum-typed writers.
             side_str = (
                 leg.side.value if hasattr(leg.side, "value") else str(leg.side).upper()
             )
@@ -156,12 +144,12 @@ class BaseExecutionClient:
                     book_str,
                 ),
             )
-            # Note: caller is responsible for committing in batches
         except Exception:
-            logger.exception("Failed to write order to DB")
+            logger.exception("Failed to write order %s", result.order_id)
+            raise
 
     async def write_fill_event(self, result: OrderResult, detail: str = "") -> None:
-        """Write a fill event to order_events."""
+        """Write a fill event; DB failure is fatal to reconciliation."""
         if result.filled_price is None:
             return
 
@@ -183,12 +171,12 @@ class BaseExecutionClient:
                     now,
                 ),
             )
-            # Note: caller is responsible for committing in batches
         except Exception:
-            logger.exception("Failed to write fill event to DB")
+            logger.exception("Failed to write fill event %s", result.order_id)
+            raise
 
     async def update_order_fill(self, result: OrderResult) -> None:
-        """Update an existing pending order with fill data (for live polling)."""
+        """Update an existing pending order with fill data."""
         now = int(time.time())
         try:
             await self.db.execute(
@@ -218,4 +206,5 @@ class BaseExecutionClient:
             )
             await self.db.commit()
         except Exception:
-            logger.exception("Failed to update order fill")
+            logger.exception("Failed to update order fill %s", result.order_id)
+            raise
