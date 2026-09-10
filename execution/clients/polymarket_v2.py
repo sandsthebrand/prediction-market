@@ -226,6 +226,8 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
     async def list_open_orders(self) -> list[dict]:
         """Return the complete authenticated Polymarket open-order set."""
         self._ensure_client()
+        if self._client is None:
+            raise RuntimeError("Polymarket client initialization failed")
         orders = await self._call(self._client.get_open_orders)
         if not isinstance(orders, list):
             raise RuntimeError("Polymarket open-orders response was not a list")
@@ -240,6 +242,8 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
         timestamp to bound the query during normal operation.
         """
         self._ensure_client()
+        if self._client is None:
+            raise RuntimeError("Polymarket client initialization failed")
         from py_clob_client_v2 import TradeParams
 
         params = TradeParams(after=int(since)) if since is not None else None
