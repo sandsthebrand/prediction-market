@@ -24,5 +24,20 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: pip install -r requirements.txt
-      - run: python -m pytest -q tests/unit/test_arb_execution.py tests/unit/test_arb_profitability.py
+      - run: >-
+          python -m pytest -q
+          tests/unit/test_arb_execution.py
+          tests/unit/test_arb_profitability.py
+          tests/unit/test_phase1_preflight.py
+      - run: >-
+          python -m mypy
+          core/engine/arb_depth.py
+          core/engine/arb_execution.py
+          core/engine/arb_profitability.py
+          core/engine/execution_control.py
+          core/matching/contract_guard.py
+          execution/clients/polymarket_v2.py
+          execution/clients/kalshi_v2.py
+          execution/factory.py
+          --follow-imports=skip
       - run: python -m compileall -q core execution
