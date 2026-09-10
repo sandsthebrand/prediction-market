@@ -1,7 +1,7 @@
 """
 Base execution client with shared DB write logic.
 
-All execution clients (mock, kalshi, polymarket, paper) write to the same
+All execution clients (mock, paper, kalshi, polymarket) write to the same
 DB tables in the same format. This base class enforces that contract.
 """
 
@@ -63,6 +63,28 @@ class BaseExecutionClient:
 
     async def get_order_status(self, order_id: str) -> dict | None:
         """Get order status. Subclasses must implement."""
+        raise NotImplementedError
+
+    async def list_open_orders(self) -> list[dict]:
+        """Return all exchange-side open orders for reconciliation.
+
+        Live clients must override this. Returning an empty list by default
+        would be unsafe because it could make an unavailable exchange look
+        clean, so the default is deliberately unsupported.
+        """
+        raise NotImplementedError
+
+    async def list_recent_fills(self, since: int | None = None) -> list[dict]:
+        """Return exchange-side fills for reconciliation.
+
+        ``since`` is an optional Unix epoch hint. Implementations may return
+        a wider window because the exchange pagination model may not map
+        directly to timestamps.
+        """
+        raise NotImplementedError
+
+    async def get_exchange_positions(self) -> list[dict]:
+        """Return exchange-side positions for reconciliation."""
         raise NotImplementedError
 
     async def get_balance(self) -> float | None:
