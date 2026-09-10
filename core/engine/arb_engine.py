@@ -367,14 +367,12 @@ class ArbitrageEngine(_LegacyArbitrageEngine):
 
     @staticmethod
     def _fee_rate(platform):
-        key = (
-            "POLYMARKET_FEE_RATE"
-            if platform == "polymarket"
-            else "KALSHI_FEE_RATE"
-        )
+        key = "POLYMARKET_FEE_RATE" if platform == "polymarket" else "KALSHI_FEE_RATE"
         value = os.getenv(key, "").strip()
         if not value:
-            raise ValueError(f"{key} is not configured; refusing optimistic fee estimate")
+            raise ValueError(
+                f"{key} is not configured; refusing optimistic fee estimate"
+            )
         try:
             rate = float(value)
         except ValueError as exc:
