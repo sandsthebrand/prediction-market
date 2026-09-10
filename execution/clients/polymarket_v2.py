@@ -129,9 +129,11 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
                     platform="polymarket",
                     status="pending",
                     submission_latency_ms=int((time.time() - start) * 1000),
+                    fee_verified=False,
                 ),
                 signal_id=signal_id,
                 strategy=strategy,
+                resolved=resolved,
             )
             return await self._poll(oid, leg, start)
         except Exception as exc:
@@ -160,7 +162,21 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
             if status in {"MATCHED", "UNMATCHED", "CANCELED", "CANCELLED"}:
                 if matched > 0:
                     price = float(order.get("price", leg.limit_price or 0))
-                    fee = await self._estimate_fee(leg.market_id, price, matched)
+                    fee = None
+                    fee_verified = False
+                    fee_error = None
+                    try:
+                        fee = await self._estimate_fee(leg.market_id, price, matched)
+                        fee_verified = True
+                    except Exception as exc:
+                        # A confirmed fill is exchange truth. Fee verification is
+                        # secondary and must never downgrade the fill to failed.
+                        fee_error = str(exc)
+                        logger.error(
+                            "Polymarket fill %s confirmed but fee is unverified: %s",
+                            oid,
+                            fee_error,
+                        )
                     result = OrderResult(
                         order_id=oid,
                         platform="polymarket",
@@ -170,6 +186,10 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
                         filled_price=price,
                         filled_size=matched,
                         fee_paid=fee,
+                        fee_verified=fee_verified,
+                        error_message=(
+                            f"fee unverified: {fee_error}" if fee_error else None
+                        ),
                     )
                     await self.update_order_fill(result)
                     await self.write_fill_event(result)
@@ -180,6 +200,7 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
                     status="failed",
                     submission_latency_ms=int((time.time() - start) * 1000),
                     error_message=f"terminal status={status}",
+                    fee_verified=False,
                 )
                 await self.update_order_fill(result)
                 return result
@@ -190,23 +211,19 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
             status="pending",
             submission_latency_ms=int((time.time() - start) * 1000),
             error_message="fill poll timeout; cancelled and requires reconciliation",
+            fee_verified=False,
         )
 
     async def _estimate_fee(self, condition_id, price, size):
-        try:
-            info = await self._call(self._client.get_clob_market_info, condition_id)
-            fd = info.get("fd")
-            if not fd or fd.get("r") is None:
-                raise ValueError("fee metadata missing")
-            rate = float(fd["r"])
-            exponent = int(fd.get("e", 2) or 2)
-            raw = size * rate * price * (1.0 - price)
-            scale = 10**exponent
-            return -(-raw * scale // 1) / scale
-        except Exception as exc:
-            raise RuntimeError(
-                f"Unable to verify Polymarket fee for fill: {exc}"
-            ) from exc
+        info = await self._call(self._client.get_clob_market_info, condition_id)
+        fd = info.get("fd")
+        if not fd or fd.get("r") is None:
+            raise ValueError("fee metadata missing")
+        rate = float(fd["r"])
+        exponent = int(fd.get("e", 2) or 2)
+        raw = size * rate * price * (1.0 - price)
+        scale = 10**exponent
+        return -(-raw * scale // 1) / scale
 
     def economic_fill_price(self, order_id, price):
         return (
@@ -241,8 +258,13 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
                 self._client.get_balance_allowance,
                 BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
             )
-            raw = result.get("balance", result.get("balance_dollars", 0))
-            return float(raw) / 1e6 if float(raw) > 1000 else float(raw)
+            raw = result.get("balance")
+            if raw is None:
+                raise ValueError("Polymarket collateral balance missing")
+            scale = float(os.getenv("POLYMARKET_BALANCE_SCALE", "1000000"))
+            if scale <= 0:
+                raise ValueError("POLYMARKET_BALANCE_SCALE must be positive")
+            return float(raw) / scale
         except Exception:
             logger.exception("Polymarket V2 balance lookup failed")
             return None
