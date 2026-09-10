@@ -67,7 +67,8 @@ class KalshiExecutionClientV2(BaseExecutionClient):
         sig = self._private_key.sign(
             (ts + method.upper() + path).encode(),
             padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
             ),
             hashes.SHA256(),
         )
@@ -141,12 +142,20 @@ class KalshiExecutionClientV2(BaseExecutionClient):
                 continue
             order = response.json().get("order", response.json())
             status = str(order.get("status", "")).lower()
-            matched = float(order.get("fill_count_fp", order.get("fill_count", 0)) or 0)
+            matched = float(
+                order.get("fill_count_fp", order.get("fill_count", 0)) or 0
+            )
             if status in {"executed", "filled", "canceled", "cancelled"}:
                 if matched > 0:
-                    price = float(order.get("yes_price_dollars", leg.limit_price))
-                    taker_fee = float(order.get("taker_fees_dollars", 0) or 0)
-                    maker_fee = float(order.get("maker_fees_dollars", 0) or 0)
+                    price = float(
+                        order.get("yes_price_dollars", leg.limit_price)
+                    )
+                    taker_fee = float(
+                        order.get("taker_fees_dollars", 0) or 0
+                    )
+                    maker_fee = float(
+                        order.get("maker_fees_dollars", 0) or 0
+                    )
                     fee = taker_fee + maker_fee
                     result = OrderResult(
                         order_id=oid,
@@ -176,7 +185,9 @@ class KalshiExecutionClientV2(BaseExecutionClient):
             platform="kalshi",
             status="pending",
             submission_latency_ms=int((time.time() - start) * 1000),
-            error_message="fill poll timeout; order cancelled and requires reconciliation",
+            error_message=(
+                "fill poll timeout; order cancelled and requires reconciliation"
+            ),
         )
 
     async def cancel_order(self, oid):
