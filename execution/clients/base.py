@@ -30,6 +30,7 @@ class OrderResult:
     filled_price: float | None = None
     filled_size: float | None = None
     fee_paid: float | None = None
+    fee_verified: bool = True
     slippage: float | None = None
     error_message: str | None = None
 
@@ -100,7 +101,7 @@ class BaseExecutionClient:
                     market_id, side, order_type,
                     requested_price, requested_size,
                     filled_price, filled_size, slippage, fee_paid,
-                    status, failure_reason,
+                    fee_verified, status, failure_reason,
                     retry_count, submitted_at,
                     filled_at, submission_latency_ms, fill_latency_ms,
                     strategy, updated_at, book
@@ -109,7 +110,7 @@ class BaseExecutionClient:
                     ?, ?, ?,
                     ?, ?,
                     ?, ?, ?, ?,
-                    ?, ?,
+                    ?, ?, ?,
                     0, ?,
                     ?, ?, ?,
                     ?, ?, ?
@@ -133,6 +134,7 @@ class BaseExecutionClient:
                     result.filled_size,
                     result.slippage,
                     result.fee_paid,
+                    int(result.fee_verified),
                     result.status,
                     result.error_message,
                     now,
@@ -186,6 +188,7 @@ class BaseExecutionClient:
                     filled_size = ?,
                     slippage = ?,
                     fee_paid = ?,
+                    fee_verified = ?,
                     fill_latency_ms = ?,
                     filled_at = ?,
                     status = ?,
@@ -197,6 +200,7 @@ class BaseExecutionClient:
                     result.filled_size,
                     result.slippage,
                     result.fee_paid,
+                    int(result.fee_verified),
                     result.fill_latency_ms,
                     now,
                     result.status,
