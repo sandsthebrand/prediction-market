@@ -160,6 +160,7 @@ class KalshiExecutionClientV2(BaseExecutionClient):
                     platform="kalshi",
                     status="pending",
                     submission_latency_ms=int((time.time() - start) * 1000),
+                    fee_verified=False,
                 ),
                 signal_id=signal_id,
                 strategy=strategy,
@@ -210,6 +211,7 @@ class KalshiExecutionClientV2(BaseExecutionClient):
                         filled_price=price,
                         filled_size=matched,
                         fee_paid=fee,
+                        fee_verified=True,
                     )
                     await self.update_order_fill(result)
                     await self.write_fill_event(result)
@@ -220,6 +222,7 @@ class KalshiExecutionClientV2(BaseExecutionClient):
                     status="failed",
                     submission_latency_ms=int((time.time() - start) * 1000),
                     error_message="order cancelled without fill",
+                    fee_verified=True,
                 )
                 await self.update_order_fill(result)
                 return result
@@ -232,6 +235,7 @@ class KalshiExecutionClientV2(BaseExecutionClient):
             error_message=(
                 "fill poll timeout; order cancelled and requires reconciliation"
             ),
+            fee_verified=False,
         )
 
     async def cancel_order(self, oid):
@@ -267,10 +271,15 @@ class KalshiExecutionClientV2(BaseExecutionClient):
             response = await self.http_client.get(
                 self.api_base + "/portfolio/balance", headers=self._sign("GET", path)
             )
-            raw = (
-                response.json().get("balance", 0) if response.status_code == 200 else 0
-            )
-            return float(raw) / 100.0 if float(raw) > 1000 else float(raw)
+            if response.status_code != 200:
+                return None
+            raw = response.json().get("balance")
+            if raw is None:
+                raise ValueError("Kalshi balance missing")
+            scale = float(os.getenv("KALSHI_BALANCE_CENTS_PER_DOLLAR", "100"))
+            if scale != 100:
+                raise ValueError("KALSHI_BALANCE_CENTS_PER_DOLLAR must remain 100")
+            return float(raw) / scale
         except Exception:
             logger.exception("Kalshi balance lookup failed")
             return None
