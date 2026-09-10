@@ -48,6 +48,7 @@ class KalshiExecutionClientV2(BaseExecutionClient):
         self.http_client = httpx.AsyncClient(timeout=15)
         self._tokens = 20.0
         self._last_refill = time.monotonic()
+        self._fee_cache = {}
 
     async def _limit(self):
         now = time.monotonic()
@@ -78,6 +79,55 @@ class KalshiExecutionClientV2(BaseExecutionClient):
             "KALSHI-ACCESS-TIMESTAMP": ts,
             "Content-Type": "application/json",
         }
+
+    async def _get_json(self, path):
+        await self._limit()
+        response = await self.http_client.get(
+            self.api_base + path,
+            headers=self._sign("GET", path),
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"GET {path} returned HTTP {response.status_code}")
+        return response.json()
+
+    async def get_pretrade_fee_rate(self, leg):
+        """Resolve the current Kalshi taker fee coefficient for this market."""
+        ticker = str(leg.market_id)
+        cached = self._fee_cache.get(ticker)
+        if cached is not None:
+            return cached
+
+        market_payload = await self._get_json(f"/markets/{ticker}")
+        market = market_payload.get("market") or {}
+        event_ticker = market.get("event_ticker")
+        if not event_ticker:
+            raise ValueError(f"Kalshi market {ticker} has no event ticker")
+
+        event_payload = await self._get_json(f"/events/{event_ticker}")
+        event = event_payload.get("event") or {}
+        series_ticker = event.get("series_ticker")
+        if not series_ticker:
+            raise ValueError(f"Kalshi event {event_ticker} has no series ticker")
+
+        series_payload = await self._get_json(f"/series/{series_ticker}")
+        series = series_payload.get("series") or {}
+        fee_type = event.get("fee_type_override") or series.get("fee_type")
+        multiplier = event.get("fee_multiplier_override")
+        if multiplier is None:
+            multiplier = series.get("fee_multiplier")
+        if multiplier is None:
+            raise ValueError(f"Kalshi fee multiplier missing for {ticker}")
+        if fee_type not in {"quadratic", "quadratic_with_maker_fees"}:
+            raise ValueError(
+                f"unsupported Kalshi fee type for Phase 1: {fee_type!r}"
+            )
+
+        base_rate = float(os.getenv("KALSHI_QUADRATIC_BASE_RATE", "0.07"))
+        rate = base_rate * float(multiplier)
+        if rate < 0 or rate > 1:
+            raise ValueError(f"invalid Kalshi fee rate for {ticker}: {rate}")
+        self._fee_cache[ticker] = rate
+        return rate
 
     async def submit_order(self, leg, signal_id=None, strategy=None):
         start = time.time()
@@ -142,7 +192,9 @@ class KalshiExecutionClientV2(BaseExecutionClient):
                 continue
             order = response.json().get("order", response.json())
             status = str(order.get("status", "")).lower()
-            matched = float(order.get("fill_count_fp", order.get("fill_count", 0)) or 0)
+            matched = float(
+                order.get("fill_count_fp", order.get("fill_count", 0)) or 0
+            )
             if status in {"executed", "filled", "canceled", "cancelled"}:
                 if matched > 0:
                     price = float(order.get("yes_price_dollars", leg.limit_price))
