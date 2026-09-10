@@ -124,7 +124,10 @@ class ArbExecutionEngine:
                 ArbOutcome.REJECTED_PRE_TRADE,
                 buy_leg.size,
                 started,
-                f"worst-case exposure ${exposure:.4f} exceeds unhedged cap ${self.max_unhedged_exposure_usd:.4f}",
+                (
+                    f"worst-case exposure ${exposure:.4f} exceeds unhedged cap "
+                    f"${self.max_unhedged_exposure_usd:.4f}"
+                ),
             )
         try:
             buy_result, sell_result = await asyncio.gather(
