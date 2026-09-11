@@ -43,10 +43,6 @@ class Phase1PaperExecutionClient(PaperExecutionClient):
                 raise ValueError(f"invalid Polymarket fee exponent: {exponent}")
             if not 0 < price < 1:
                 raise ValueError(f"invalid Polymarket fee price: {price}")
-            # The profitability engine models fees as rate * p * (1-p).
-            # Convert the venue's fd.r/fd.e term to an equivalent rate at
-            # this executable price so the engine does not need venue-specific
-            # fee semantics.
             price_term = price * (1.0 - price)
             return rate * price_term ** (exponent - 1.0)
 
@@ -188,7 +184,13 @@ class Phase1PaperExecutionClient(PaperExecutionClient):
         price = float(result.filled_price)
         qty = float(result.filled_size or 0)
         raw_fee = qty * fee_rate * price * (1.0 - price)
-        fee = math.ceil(raw_fee * 10000.0) / 10000.0
+        # Venue fee precision matters to a $0.50 minimum-profit strategy:
+        # Polymarket charges to 5 decimal places; Kalshi's quadratic fees
+        # round up to cents. Keep paper P&L aligned with those conventions.
+        if leg.platform == "polymarket":
+            fee = math.ceil(raw_fee * 100000.0) / 100000.0
+        else:
+            fee = math.ceil(raw_fee * 100.0) / 100.0
         result = OrderResult(
             order_id=result.order_id,
             platform=result.platform,
