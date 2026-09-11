@@ -232,7 +232,7 @@ class PolymarketExecutionClientV2(BaseExecutionClient):
         if not 0 <= exponent <= 8:
             raise ValueError(f"invalid Polymarket fee exponent: {exponent}")
         raw = size * rate * (price * (1.0 - price)) ** exponent
-        scale = 10000.0
+        scale = 100000.0
         return math.ceil(raw * scale) / scale
 
     async def list_open_orders(self) -> list[dict]:
