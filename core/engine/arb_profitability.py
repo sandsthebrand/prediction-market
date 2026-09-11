@@ -1,14 +1,15 @@
 """Executable profitability calculations for Phase 1 arbitrage.
 
-There is intentionally no fixed dollar-profit floor. The gate asks whether an
-opportunity is positive after executable price, fee curve, slippage and other
-known costs. A small positive opportunity can therefore trade if execution
-risk is acceptable.
+The profitability gate combines a percentage edge requirement in the caller
+with an absolute expected-net-profit floor. The floor prevents small nominal
+edges from consuming execution capacity while fees, slippage, and other costs
+are modeled before an order is sent.
 """
 
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 
@@ -66,8 +67,15 @@ def calculate_executable_arb(
     sell_fee_exponent: float = 1.0,
     buy_fee_decimals: int = 4,
     sell_fee_decimals: int = 4,
+    min_net_profit: float | None = None,
 ) -> ExecutableArb | None:
-    """Calculate conservative pre-trade net profit for a matched pair."""
+    """Calculate conservative pre-trade net profit for a matched pair.
+
+    ``min_net_profit`` is an absolute expected-profit quality floor. When it
+    is omitted, Phase 1 uses ``PHASE1_MIN_NET_PROFIT`` and defaults to $0.50.
+    The caller still applies its percentage/net-edge threshold separately, so
+    this floor does not replace capital-efficiency filtering.
+    """
     if (
         not _price_ok(buy_price)
         or not _price_ok(sell_price)
@@ -78,6 +86,14 @@ def calculate_executable_arb(
         or extra_cost < 0
     ):
         return None
+
+    if min_net_profit is None:
+        try:
+            min_net_profit = float(os.getenv("PHASE1_MIN_NET_PROFIT", "0.50"))
+        except ValueError as exc:
+            raise ValueError("PHASE1_MIN_NET_PROFIT must be numeric") from exc
+    if min_net_profit < 0:
+        raise ValueError("PHASE1_MIN_NET_PROFIT must be non-negative")
 
     slip = slippage_bps / 10000.0
     effective_buy = min(0.999999, buy_price * (1.0 + slip))
@@ -110,5 +126,5 @@ def calculate_executable_arb(
         gross_profit=(sell_price - buy_price) * quantity,
         net_profit=net,
         net_edge_per_contract=net / quantity,
-        profitable=net > 0,
+        profitable=net >= min_net_profit,
     )
