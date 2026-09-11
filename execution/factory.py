@@ -1,70 +1,52 @@
-"""
-Execution client factory functions.
-
-Provides _make_execution_clients and _make_single_execution_client which
-dispatch to the appropriate live or paper execution client based on the
-execution_mode parameter.
-"""
+"""Execution client factory."""
 
 import logging
+import os
 
 from execution.clients.base import BaseExecutionClient
 
 logger = logging.getLogger(__name__)
 
 
+def _assert_phase1_live_preflight():
+    required = {
+        "PHASE1_FEES_VERIFIED": "true",
+        "PHASE1_API_V2_VERIFIED": "true",
+    }
+    missing = [k for k, v in required.items() if os.getenv(k, "").lower() != v]
+    if missing:
+        raise RuntimeError(
+            "Live execution blocked: set verified preflight flags: "
+            + ", ".join(missing)
+        )
+
+
 def _make_execution_clients(
     db, execution_mode: str
 ) -> tuple[BaseExecutionClient, BaseExecutionClient]:
-    """
-    Return (poly_client, kalshi_client) for the given execution mode.
-
-    - "live"            → real PolymarketExecutionClient + KalshiExecutionClient
-    - "paper"/"shadow"  → PaperExecutionClient (simulated fills, no real orders)
-
-    Shadow mode uses paper clients by design: full signal/risk pipeline runs
-    but no real orders are submitted.
-    """
-    poly_client: BaseExecutionClient
-    kalshi_client: BaseExecutionClient
     if execution_mode == "live":
-        from execution.clients.kalshi import KalshiExecutionClient
-        from execution.clients.polymarket import PolymarketExecutionClient
+        _assert_phase1_live_preflight()
+        from execution.clients.kalshi_v2 import KalshiExecutionClientV2
+        from execution.clients.polymarket_v2 import PolymarketExecutionClientV2
 
-        poly_client = PolymarketExecutionClient(db)
-        kalshi_client = KalshiExecutionClient(db)
-        logger.info("Execution clients: LIVE (Polymarket + Kalshi)")
-    else:
-        from execution.clients.paper import PaperExecutionClient
+        return PolymarketExecutionClientV2(db), KalshiExecutionClientV2(db)
+    from execution.clients.paper_phase1 import Phase1PaperExecutionClient
 
-        poly_client = PaperExecutionClient(db, platform_label="polymarket")
-        kalshi_client = PaperExecutionClient(db, platform_label="paper_kalshi")
-        label = (
-            "SHADOW (paper clients, no real orders)"
-            if execution_mode == "shadow"
-            else "PAPER (simulated)"
-        )
-        logger.info("Execution clients: %s", label)
-    return poly_client, kalshi_client
+    return Phase1PaperExecutionClient(
+        db, platform_label="polymarket"
+    ), Phase1PaperExecutionClient(db, platform_label="paper_kalshi")
 
 
 def _make_single_execution_client(db, execution_mode: str, platform: str):
-    """
-    Return a single execution client for single-platform strategies.
-
-    In live mode, returns the appropriate live client. In paper or shadow mode,
-    returns a PaperExecutionClient (shadow uses paper clients by design).
-    """
     if execution_mode == "live":
+        _assert_phase1_live_preflight()
         if platform == "polymarket":
-            from execution.clients.polymarket import PolymarketExecutionClient
+            from execution.clients.polymarket_v2 import PolymarketExecutionClientV2
 
-            return PolymarketExecutionClient(db)
-        else:
-            from execution.clients.kalshi import KalshiExecutionClient
+            return PolymarketExecutionClientV2(db)
+        from execution.clients.kalshi_v2 import KalshiExecutionClientV2
 
-            return KalshiExecutionClient(db)
-    else:
-        from execution.clients.paper import PaperExecutionClient
+        return KalshiExecutionClientV2(db)
+    from execution.clients.paper_phase1 import Phase1PaperExecutionClient
 
-        return PaperExecutionClient(db, platform_label=f"paper_{platform}")
+    return Phase1PaperExecutionClient(db, platform_label=f"paper_{platform}")

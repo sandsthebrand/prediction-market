@@ -1,536 +1,58 @@
-"""Event-driven arbitrage engine.
+"""Phase 1 hardened arbitrage engine."""
 
-Provides ArbitrageEngine which monitors matched pairs and executes
-cross-platform arb trades when websocket price updates reveal spread violations.
-"""
+from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import os
-import random
-import time
 import uuid
-from collections import defaultdict
 from datetime import datetime, timezone
 
-import aiosqlite
-
-from core.config import RiskControlConfig, get_config
-from core.engine.fire_state import PairFireState, _RiskLeg, _RiskSignal
-from execution.clients.base import BaseExecutionClient, OrderResult
+from core.engine.arb_depth import executable_quantity, get_executable_depth
+from core.engine.arb_engine_legacy import ArbitrageEngine as _LegacyArbitrageEngine
+from core.engine.arb_execution import ArbExecutionEngine, ArbOutcome
+from core.engine.arb_profitability import calculate_executable_arb
+from core.engine.execution_control import halt, is_halted
+from core.engine.fire_state import _RiskLeg, _RiskSignal
+from core.engine.reconciliation import reconcile_exchange_state
+from core.matching.contract_guard import verify_contract_equivalence
 from execution.enums import Side
 from execution.models import OrderLeg
 
 logger = logging.getLogger(__name__)
 
 
-class ArbitrageEngine:
-    """Event-driven cross-platform arbitrage.
+class ArbitrageEngine(_LegacyArbitrageEngine):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._exchange_reconciled = False
 
-    Holds an in-memory index of matched pairs and their latest prices.
-    When a websocket price update arrives, `on_price_update()` is called
-    synchronously to check if any spread now exceeds the threshold.
-    If so, the trade is executed immediately — no polling loop.
-
-    This keeps arb latency bounded by websocket delivery + trade execution,
-    not by a sleep-based cycle interval.
-    """
-
-    def __init__(
-        self,
-        db: aiosqlite.Connection,
-        matches: list[dict],
-        min_spread: float = 0.03,
-        risk_config: "RiskControlConfig | None" = None,
-        circuit_breaker=None,
-        execution_mode: str | None = None,
-    ):
-        self.db = db
-        self.min_spread = min_spread
-        self.trades: list[dict] = []
-        # Per-pair locks so independent pairs can execute concurrently.
-        # setdefault guarantees safe lazy creation under asyncio (no TOCTOU).
-        self._pair_locks: dict[str, asyncio.Lock] = {}
-
-        # Phase 2: risk config and circuit breaker.
-        # Phase 6: when execution_mode is provided and risk_config is not, use
-        # get_effective_risk_config so live mode automatically enforces tighter limits.
-        if risk_config is not None:
-            self._risk_config: RiskControlConfig = risk_config
-        elif execution_mode is not None:
-            from core.live_gate import get_effective_risk_config
-
-            self._risk_config = get_effective_risk_config(execution_mode)
-        else:
-            self._risk_config = RiskControlConfig()
-        self._circuit_breaker = circuit_breaker
-
-        # Live price cache: market_id -> price
-        self.prices: dict[str, float] = {}
-
-        # fired_state: per-pair cooldown and re-arm state (Phase 3).
-        # Replaced the bare recently_fired set to support cooldown + hysteresis re-arm.
-        self.fired_state: dict[str, PairFireState] = {}
-
-        # Telemetry fields surfaced in stats() and the STATUS log line.
-        self.last_arb_fired_at: float | None = None
-        self._ticks_since_last_fire: int = 0
-        self._last_tick_at: dict[str, float] = {}  # market_id -> time.time()
-        self._market_platform: dict[str, str] = {}  # market_id -> "polymarket"/"kalshi"
-        # Count of fires suppressed because one side's cached price was
-        # older than risk_config.max_price_age_s. Surfaced in stats().
-        self._skipped_stale: int = 0
-
-        # Build pair indexes for O(1) lookup on price update
-        # poly_id -> list of (kalshi_id, match_dict)
-        # kalshi_id -> list of (poly_id, match_dict)
-        self._poly_to_pairs: dict[str, list[dict]] = defaultdict(list)
-        self._kalshi_to_pairs: dict[str, list[dict]] = defaultdict(list)
-        self._pairs: dict[str, dict] = {}  # pair_id -> match
-
-        # Treat seeded prices as fresh at startup so initial_sweep has a
-        # window to fire. Once max_price_age_s elapses without a real WS
-        # tick, the staleness guard kicks in. Use a single timestamp across
-        # all seeds so the window is uniform.
-        seed_ts = time.time()
-        for m in matches:
-            pair_id = f"{m['poly_id']}_{m['kalshi_id']}"
-            self._pairs[pair_id] = m
-            self._poly_to_pairs[m["poly_id"]].append(m)
-            self._kalshi_to_pairs[m["kalshi_id"]].append(m)
-            self._market_platform[m["poly_id"]] = "polymarket"
-            self._market_platform[m["kalshi_id"]] = "kalshi"
-            # Seed prices from match data
-            if m.get("poly_price"):
-                self.prices[m["poly_id"]] = m["poly_price"]
-                self._last_tick_at[m["poly_id"]] = seed_ts
-            if m.get("kalshi_price"):
-                self.prices[m["kalshi_id"]] = m["kalshi_price"]
-                self._last_tick_at[m["kalshi_id"]] = seed_ts
-
-        # Execution clients (live or paper depending on EXECUTION_MODE)
-        execution_mode = execution_mode or os.getenv("EXECUTION_MODE", "paper")
-        from execution.factory import _make_execution_clients
-
-        self._poly_client, self._kalshi_client = _make_execution_clients(
-            db, execution_mode
-        )
-
-        # Track pairs that need an initial sweep (prices seeded from match data)
-        self._needs_initial_sweep = True
-
-        logger.info(
-            "ArbitrageEngine initialized: %d pairs, min_spread=%.4f",
-            len(self._pairs),
-            min_spread,
-        )
-
-    @property
-    def recently_fired(self) -> set[str]:
-        """Backward-compatible view of all pairs that have ever fired."""
-        return set(self.fired_state.keys())
-
-    def update_pairs(self, matches: list[dict]) -> dict:
-        """Replace the pair index with ``matches``. Safe to call while running.
-
-        Retains ``fired_state`` and live ``prices`` for markets still present.
-        Adds new pairs, drops pairs no longer in the match set, and seeds
-        prices for newly-added markets from the match data only when we
-        don't already have a live price from the websocket feed.
-
-        Flags the next ``initial_sweep()`` call to fire so the caller can
-        pick up any new pairs that are already above the spread threshold
-        at refresh time.
-
-        Returns counts: ``{"added": N, "removed": N, "retained": N}``.
-        """
-        new_pair_ids = {f"{m['poly_id']}_{m['kalshi_id']}" for m in matches}
-        old_pair_ids = set(self._pairs)
-        added = new_pair_ids - old_pair_ids
-        removed = old_pair_ids - new_pair_ids
-        retained = new_pair_ids & old_pair_ids
-
-        # Rebuild indexes from scratch. At weekly refresh scale this is
-        # cheap and avoids subtle drift between the forward and reverse maps.
-        self._pairs = {}
-        self._poly_to_pairs = defaultdict(list)
-        self._kalshi_to_pairs = defaultdict(list)
-
-        # Single seed timestamp so newly-added markets share a uniform
-        # freshness window after a refresh.
-        seed_ts = time.time()
-        for m in matches:
-            pair_id = f"{m['poly_id']}_{m['kalshi_id']}"
-            self._pairs[pair_id] = m
-            self._poly_to_pairs[m["poly_id"]].append(m)
-            self._kalshi_to_pairs[m["kalshi_id"]].append(m)
-            self._market_platform.setdefault(m["poly_id"], "polymarket")
-            self._market_platform.setdefault(m["kalshi_id"], "kalshi")
-            # Seed prices for markets we've never seen a tick for. Don't
-            # clobber live prices — match data is stale compared to the WS feed.
-            if m.get("poly_price") and m["poly_id"] not in self.prices:
-                self.prices[m["poly_id"]] = m["poly_price"]
-                self._last_tick_at.setdefault(m["poly_id"], seed_ts)
-            if m.get("kalshi_price") and m["kalshi_id"] not in self.prices:
-                self.prices[m["kalshi_id"]] = m["kalshi_price"]
-                self._last_tick_at.setdefault(m["kalshi_id"], seed_ts)
-
-        for pair_id in removed:
-            self.fired_state.pop(pair_id, None)
-            self._pair_locks.pop(pair_id, None)
-
-        # Prune per-market state for markets no longer referenced by any pair.
-        # Without this, _market_platform / _last_tick_at / prices grew by ~2
-        # entries per removed pair on every weekly refresh — a slow leak that
-        # accumulates over the lifetime of a long-running process.
-        live_market_ids: set[str] = set()
-        for m in self._pairs.values():
-            live_market_ids.add(m["poly_id"])
-            live_market_ids.add(m["kalshi_id"])
-
-        stale_market_ids = (
-            set(self._market_platform) | set(self._last_tick_at) | set(self.prices)
-        ) - live_market_ids
-        for mid in stale_market_ids:
-            self._market_platform.pop(mid, None)
-            self._last_tick_at.pop(mid, None)
-            self.prices.pop(mid, None)
-
-        if added:
-            self._needs_initial_sweep = True
-
-        # Reset the stale-skip counter so stats() reflects skips since the
-        # most recent pair refresh rather than the lifetime of the engine.
-        prev_skipped = self._skipped_stale
-        self._skipped_stale = 0
-
-        logger.info(
-            "ArbitrageEngine.update_pairs: added=%d removed=%d retained=%d "
-            "total=%d pruned_markets=%d skipped_stale_reset=%d",
-            len(added),
-            len(removed),
-            len(retained),
-            len(self._pairs),
-            len(stale_market_ids),
-            prev_skipped,
-        )
-        return {
-            "added": len(added),
-            "removed": len(removed),
-            "retained": len(retained),
-        }
-
-    def _get_pair_lock(self, pair_id: str) -> asyncio.Lock:
-        """Return the per-pair lock, creating it on first use.
-
-        setdefault is atomic under asyncio (single-threaded event loop) so
-        two coroutines racing to create the same pair's lock will both call
-        setdefault but only the first insertion wins; no TOCTOU race.
-        """
-        return self._pair_locks.setdefault(pair_id, asyncio.Lock())
-
-    def _is_fresh(self, market_id: str, now: float | None = None) -> bool:
-        """Return True if ``market_id``'s cached price was updated within
-        ``risk_config.max_price_age_s`` seconds.
-
-        This is the staleness guard that prevents firing on cached prices
-        the live market has already drifted past. Missing tick times are
-        treated as stale (the guard's job is to be conservative).
-        """
-        t = self._last_tick_at.get(market_id)
-        if t is None:
-            return False
-        if now is None:
-            now = time.time()
-        return (now - t) <= self._risk_config.max_price_age_s
-
-    def _is_eligible(self, pair_id: str) -> bool:
-        """Return True if pair_id may fire (never fired, armed, and cooldown elapsed)."""
-        state = self.fired_state.get(pair_id)
-        if state is None:
-            return True  # Never fired — always eligible
-        if not state.armed:
-            return False  # Waiting for spread reversion
-        return (time.time() - state.last_fired_at) >= self._risk_config.arb_cooldown_s
-
-    def _check_rearm(self, pair_id: str, spread: float) -> None:
-        """Re-arm pair if spread has reverted below the hysteresis threshold."""
-        state = self.fired_state.get(pair_id)
-        if state is None or state.armed:
-            return
-        threshold = self.min_spread - self._risk_config.arb_rearm_hysteresis
-        if spread < threshold:
-            state.armed = True
-
-    async def _try_fire_pair(self, match: dict, pair_id: str, now: float) -> bool:
-        """Attempt to fire an arb trade for one pair at timestamp ``now``.
-
-        Performs the full eligibility + staleness + lock + execute cycle.
-        Returns True if a trade was recorded, False otherwise (below threshold,
-        ineligible, stale, risk-rejected, or execution error).
-
-        fired_state is updated only on a successful trade so that risk/CB
-        rejections and exceptions leave the pair retriable (Phase 2 contract).
-        """
-        p_price = self.prices.get(match["poly_id"])
-        k_price = self.prices.get(match["kalshi_id"])
-        if p_price is None or k_price is None:
-            return False
-
-        spread = abs(p_price - k_price)
-        # Re-arm check runs unconditionally so spread reversions are captured
-        # even when we ultimately don't fire (spread below threshold).
-        self._check_rearm(pair_id, spread)
-
-        if spread < self.min_spread:
-            return False
-
-        if not self._is_eligible(pair_id):
-            return False
-
-        # Staleness guard: firing on a cached price the market has drifted
-        # past produces guaranteed-reject limit orders on the exchange.
-        if not (
-            self._is_fresh(match["poly_id"], now)
-            and self._is_fresh(match["kalshi_id"], now)
-        ):
-            self._skipped_stale += 1
-            stale_poly = not self._is_fresh(match["poly_id"], now)
-            stale_market = match["poly_id"] if stale_poly else match["kalshi_id"]
-            stale_age_ms = int(
-                (now - (self._last_tick_at.get(stale_market) or now)) * 1000
-            )
-            logger.debug(
-                "Skipping stale fire pair=%s stale_market=%s tick_age_ms=%d",
-                pair_id,
-                stale_market,
-                stale_age_ms,
-            )
-            return False
-
-        # Execute under a per-pair lock to prevent concurrent trades on the same
-        # pair while allowing different pairs to execute concurrently.
-        async with self._get_pair_lock(pair_id):
-            # Re-read prices under lock: an on_price_update() awaited while we
-            # waited for the lock could have moved prices, so snapshot them
-            # fresh here to avoid trading on a spread that has already closed.
-            p_price = self.prices.get(match["poly_id"])
-            k_price = self.prices.get(match["kalshi_id"])
-            if p_price is None or k_price is None:
-                return False
-            spread = abs(p_price - k_price)
-            self._check_rearm(pair_id, spread)
-            if spread < self.min_spread:
-                return False
-            if not self._is_eligible(pair_id):
-                return False
-            # Re-check freshness with current wall-clock time (not pre-lock `now`),
-            # since lock wait + retry delays can push elapsed time past max_price_age_s.
-            if not (
-                self._is_fresh(match["poly_id"]) and self._is_fresh(match["kalshi_id"])
-            ):
-                self._skipped_stale += 1
-                now_inner = time.time()
-                stale_poly_inner = not self._is_fresh(match["poly_id"], now_inner)
-                stale_market_inner = (
-                    match["poly_id"] if stale_poly_inner else match["kalshi_id"]
-                )
-                stale_age_ms_inner = int(
-                    (
-                        now_inner
-                        - (self._last_tick_at.get(stale_market_inner) or now_inner)
-                    )
-                    * 1000
-                )
-                logger.debug(
-                    "Skipping stale fire pair=%s stale_market=%s tick_age_ms=%d",
-                    pair_id,
-                    stale_market_inner,
-                    stale_age_ms_inner,
-                )
-                return False
-            try:
-                trade = await self._execute_arb_trade(
-                    match, p_price, k_price, spread, pair_id
-                )
-            except Exception:
-                logger.exception(
-                    "Unhandled exception in _try_fire_pair for pair %s", pair_id
-                )
-                return False
-            if trade:
-                self.fired_state[pair_id] = PairFireState(
-                    last_fired_at=time.time(), armed=False
-                )
-                self.trades.append(trade)
-                self.last_arb_fired_at = time.time()
-                self._ticks_since_last_fire = 0
-                return True
-        return False
-
-    async def initial_sweep(self) -> None:
-        """Check all seeded pairs for opportunities at startup.
-
-        Prices are seeded from match data before any websocket tick arrives.
-        Without this sweep, pairs already above the spread threshold at launch
-        are invisible until a price delta triggers on_price_update.
-        """
-        if not self._needs_initial_sweep:
-            return
-        self._needs_initial_sweep = False
-
-        swept = 0
-        now = time.time()
-        for match in self._pairs.values():
-            pair_id = f"{match['poly_id']}_{match['kalshi_id']}"
-            if await self._try_fire_pair(match, pair_id, now):
-                swept += 1
-
-        if swept:
-            logger.info("Initial sweep found %d arb opportunities", swept)
-
-    async def on_price_update(self, market_id: str, new_price: float):
-        """Called by websocket handlers on every price tick.
-
-        Checks all pairs involving this market_id. If any spread
-        exceeds threshold and we don't have an open position, trade.
-        """
-        old_price = self.prices.get(market_id)
-        self.prices[market_id] = new_price
-        self._last_tick_at[market_id] = time.time()
-
-        # Skip if price didn't change meaningfully
-        if old_price is not None and abs(new_price - old_price) < 0.001:
-            return
-
-        self._ticks_since_last_fire += 1
-
-        # Find all pairs involving this market
-        affected = []
-        if market_id in self._poly_to_pairs:
-            affected.extend(self._poly_to_pairs[market_id])
-        if market_id in self._kalshi_to_pairs:
-            affected.extend(self._kalshi_to_pairs[market_id])
-
-        now = time.time()
-        for match in affected:
-            pair_id = f"{match['poly_id']}_{match['kalshi_id']}"
-            await self._try_fire_pair(match, pair_id, now)
-
-    async def periodic_scan(self) -> None:
-        """Scan all tracked pairs for arbitrage opportunities.
-
-        Called on a timer, independent of price-tick events. Catches pairs
-        whose spread opened while both prices drifted simultaneously (no single
-        tick would have triggered on_price_update for the pair).
-        """
-        now = time.time()
-        for match in self._pairs.values():
-            pair_id = f"{match['poly_id']}_{match['kalshi_id']}"
-            await self._try_fire_pair(match, pair_id, now)
-
-    async def _submit_with_retry(
-        self,
-        client: BaseExecutionClient,
-        leg: OrderLeg,
-        signal_id: str | None,
-        strategy: str | None,
-    ) -> OrderResult:
-        """Submit an order with exponential backoff on transient failures.
-
-        Retries up to `execution.max_order_retries` attempts when the venue
-        returns a non-filled status, with delay `retry_backoff_base_s * 2**n`
-        plus jitter between attempts. Each retry opens a new venue order
-        (submit_order is not idempotent), which is safe because the prior
-        attempt reported no fill. Every attempt's orders row is written by
-        the client; an `order_events` row is appended here to record the
-        retry reason so post-mortems can trace the sequence.
-
-        Returns the last OrderResult (filled if any attempt fills, otherwise
-        the final failure).
-        """
-        cfg = get_config().execution
-        max_attempts = max(1, cfg.max_order_retries)
-        base_s = cfg.retry_backoff_base_s
-
-        last_result: OrderResult | None = None
-        for attempt in range(1, max_attempts + 1):
-            result = await client.submit_order(
-                leg, signal_id=signal_id, strategy=strategy
-            )
-            last_result = result
-            # Accept any partial or full fill; only retry on clean failure.
-            if result.status in ("filled", "partially_filled"):
-                if attempt > 1:
-                    logger.info(
-                        "ORDER_RETRY_SUCCESS order=%s market=%s attempt=%d/%d",
-                        result.order_id,
-                        leg.market_id,
-                        attempt,
-                        max_attempts,
-                    )
-                return result
-
-            if attempt < max_attempts:
-                delay = base_s * (2 ** (attempt - 1)) * (1 + random.random() * 0.25)
-                logger.warning(
-                    "ORDER_RETRY order=%s market=%s attempt=%d/%d status=%s err=%r "
-                    "next_delay=%.2fs",
-                    result.order_id,
-                    leg.market_id,
-                    attempt,
-                    max_attempts,
-                    result.status,
-                    result.error_message,
-                    delay,
-                )
-                try:
-                    await self.db.execute(
-                        """INSERT INTO order_events
-                           (order_id, event_type, detail, occurred_at)
-                           VALUES (?, 'retry', ?, ?)""",
-                        (
-                            result.order_id,
-                            (
-                                f"attempt={attempt} status={result.status} "
-                                f"err={result.error_message or ''}"
-                            ),
-                            datetime.now(timezone.utc).isoformat(),
-                        ),
-                    )
-                except Exception:
-                    logger.debug("order_events retry log failed", exc_info=True)
-                await asyncio.sleep(delay)
-            else:
-                logger.error(
-                    "ORDER_RETRY_EXHAUSTED order=%s market=%s attempts=%d status=%s err=%r",
-                    result.order_id,
-                    leg.market_id,
-                    max_attempts,
-                    result.status,
-                    result.error_message,
-                )
-
-        assert last_result is not None  # max_attempts >= 1
-        return last_result
-
-    async def _execute_arb_trade(
-        self,
-        match: dict,
-        p_price: float,
-        k_price: float,
-        spread: float,
-        pair_id: str,
-    ) -> dict | None:
-        """Execute a single arbitrage trade on a matched pair."""
+    async def _execute_arb_trade(self, match, p_price, k_price, spread, pair_id):
         from core.signals.risk import get_portfolio_value, run_all_checks
-        from core.signals.sizing import compute_kelly_fraction, compute_position_size
 
-        now = datetime.now(timezone.utc).isoformat()
+        if os.getenv("EXECUTION_MODE", "paper").lower() == "live" and not self._exchange_reconciled:
+            reconciliation = await reconcile_exchange_state(
+                self.db,
+                {
+                    "polymarket": self._poly_client,
+                    "kalshi": self._kalshi_client,
+                },
+            )
+            if not reconciliation.get("clean", False):
+                logger.critical(
+                    "Phase1 live execution blocked by exchange reconciliation: %s",
+                    reconciliation,
+                )
+                return None
+            self._exchange_reconciled = True
+
+        if await is_halted(self.db) or not (0 < p_price < 1 and 0 < k_price < 1):
+            return None
         strategy = "P1_cross_market_arb"
         signal_id = f"sig_{uuid.uuid4().hex[:12]}"
         violation_id = f"viol_{uuid.uuid4().hex[:12]}"
-
+        now = datetime.now(timezone.utc).isoformat()
         if p_price < k_price:
             buy_platform, sell_platform = "polymarket", "kalshi"
             buy_id, sell_id = match["poly_id"], match["kalshi_id"]
@@ -541,154 +63,59 @@ class ArbitrageEngine:
             buy_id, sell_id = match["kalshi_id"], match["poly_id"]
             buy_price, sell_price = k_price, p_price
             buy_client, sell_client = self._kalshi_client, self._poly_client
-
-        # Phase 2.4: circuit breaker halt check.
         if (
             self._circuit_breaker is not None
             and await self._circuit_breaker.should_halt()
         ):
-            logger.warning(
-                "CIRCUIT_BREAKER halted — skipping arb trade on pair=%s", pair_id
-            )
             return None
-
-        edge = spread
-
-        # Phase 2.3: Kelly-based position sizing (replaces hardcoded min(10, 100*edge)).
-        # Use live portfolio value so Kelly scales with account growth/drawdown.
-        kelly_f = compute_kelly_fraction(edge, self._risk_config.kelly_fraction)
+        equivalent, reason = await verify_contract_equivalence(
+            self.db, match["poly_id"], match["kalshi_id"]
+        )
+        if not equivalent:
+            logger.info("Phase1 contract guard rejected pair=%s: %s", pair_id, reason)
+            return None
         bankroll = await get_portfolio_value(
             self.db, self._risk_config.starting_capital
         )
-        max_size = bankroll * self._risk_config.max_position_pct
-        size = round(compute_position_size(kelly_f, bankroll, max_size=max_size), 1)
+        max_notional = bankroll * self._risk_config.max_position_pct
+        if bankroll <= 0 or max_notional <= 0:
+            return None
+        requested = round(max_notional / (buy_price + sell_price), 1)
+        if requested <= 0:
+            return None
+        buy_leg = OrderLeg(
+            market_id=buy_id,
+            platform=buy_platform,
+            side=Side.BUY,
+            size=requested,
+            limit_price=buy_price,
+            order_type="LIMIT",
+        )
+        sell_leg = OrderLeg(
+            market_id=sell_id,
+            platform=sell_platform,
+            side=Side.SELL,
+            size=requested,
+            limit_price=sell_price,
+            order_type="LIMIT",
+        )
+        try:
+            buy_depth, sell_depth = await asyncio.gather(
+                get_executable_depth(buy_client, buy_leg),
+                get_executable_depth(sell_client, sell_leg),
+            )
+        except Exception as exc:
+            await halt(
+                self.db,
+                f"depth query failure before arb submission pair={pair_id}: {exc}",
+            )
+            return None
+        size = executable_quantity(buy_depth, sell_depth, requested)
+        if size is None:
+            return None
+        size = round(size, 2)
         if size <= 0:
-            logger.debug(
-                "Kelly sizing produced zero size for edge=%.4f — skipping", edge
-            )
             return None
-
-        # Insert market_pair + violation BEFORE risk checks so:
-        #   (a) risk_check_log.violation_id FK is satisfied when we log
-        #       (PRAGMA foreign_keys=ON enforces this at INSERT time), and
-        #   (b) rejected trades still leave a violations row for analytics.
-        # An exception here (not a duplicate — INSERT OR IGNORE swallows those
-        # silently with rowcount=0) indicates a schema/FK/lock error, and we
-        # must abort before sending orders.
-        try:
-            await self.db.execute(
-                """INSERT OR IGNORE INTO market_pairs
-                   (id, market_id_a, market_id_b, pair_type, similarity_score,
-                    match_method, active, created_at, updated_at)
-                   VALUES (?, ?, ?, 'cross_platform', ?, 'inverted_index', 1, ?, ?)""",
-                (pair_id, buy_id, sell_id, match.get("similarity", 0.0), now, now),
-            )
-            await self.db.execute(
-                """INSERT OR IGNORE INTO violations
-                   (id, pair_id, violation_type, price_a_at_detect, price_b_at_detect,
-                    raw_spread, net_spread, fee_estimate_a, fee_estimate_b,
-                    status, detected_at, updated_at)
-                   VALUES (?, ?, 'cross_platform', ?, ?, ?, ?, ?, ?, 'detected', ?, ?)""",
-                (
-                    violation_id,
-                    pair_id,
-                    buy_price,
-                    sell_price,
-                    spread,
-                    spread - 0.02,
-                    buy_price * 0.02,
-                    sell_price * 0.02,
-                    now,
-                    now,
-                ),
-            )
-            await self.db.commit()
-        except Exception:
-            logger.exception(
-                "Aborting arb trade for pair=%s: market_pair/violation insert failed",
-                pair_id,
-            )
-            return None
-
-        # Phase 2.2: run all risk checks before executing orders.
-        risk_signal = _RiskSignal(
-            legs=[
-                _RiskLeg(
-                    market_id=buy_id, limit_price=buy_price, size=size, side="BUY"
-                ),
-                _RiskLeg(
-                    market_id=sell_id, limit_price=sell_price, size=size, side="SELL"
-                ),
-            ],
-            edge=edge,
-            strategy=strategy,
-            violation_id=violation_id,
-        )
-        all_passed, check_results = await run_all_checks(
-            risk_signal, self._risk_config, self.db, portfolio_value=bankroll
-        )
-        if not all_passed:
-            failed = [r.check_type for r in check_results if not r.passed]
-            logger.info(
-                "RISK_REJECTED pair=%s failed_checks=%s — not adding to recently_fired",
-                pair_id,
-                failed,
-            )
-            try:
-                await self.db.execute(
-                    "UPDATE violations SET status = 'risk_rejected', updated_at = ? WHERE id = ?",
-                    (datetime.now(timezone.utc).isoformat(), violation_id),
-                )
-                await self.db.commit()
-            except Exception:
-                logger.exception(
-                    "Failed to mark violation risk_rejected for violation_id=%s",
-                    violation_id,
-                )
-            return None
-
-        logger.info(
-            "ARB TRADE: spread=%.4f | %s@%.3f vs %s@%.3f",
-            spread,
-            match["poly_title"][:40],
-            p_price,
-            match["kalshi_title"][:40],
-            k_price,
-        )
-
-        try:
-            await self.db.execute(
-                """INSERT OR IGNORE INTO signals
-                   (id, violation_id, strategy, signal_type, market_id_a, market_id_b,
-                    target_price_a, target_price_b,
-                    model_edge, kelly_fraction, position_size_a, position_size_b,
-                    total_capital_at_risk, status, fired_at, updated_at)
-                   VALUES (?, ?, ?, 'arb_pair', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'fired', ?, ?)""",
-                (
-                    signal_id,
-                    violation_id,
-                    strategy,
-                    buy_id,
-                    sell_id,
-                    buy_price,
-                    sell_price,
-                    edge,
-                    kelly_f,
-                    size,
-                    size,
-                    round(size * buy_price + size * (1 - sell_price), 2),
-                    now,
-                    now,
-                ),
-            )
-            await self.db.commit()
-        except Exception:
-            logger.exception(
-                "Aborting arb trade for pair=%s: signal insert failed", pair_id
-            )
-            return None
-
-        # Execute both legs
         buy_leg = OrderLeg(
             market_id=buy_id,
             platform=buy_platform,
@@ -705,226 +132,313 @@ class ArbitrageEngine:
             limit_price=sell_price,
             order_type="LIMIT",
         )
-        _trade_start_ms = int(time.time() * 1000)
-        buy_result = await self._submit_with_retry(
-            buy_client, buy_leg, signal_id=signal_id, strategy=strategy
+        min_edge = float(os.getenv("PHASE1_MIN_NET_EDGE", "0.005"))
+        flatten_risk_bps = float(os.getenv("PHASE1_FLATTEN_RISK_BPS", "0"))
+        if flatten_risk_bps < 0:
+            raise ValueError("PHASE1_FLATTEN_RISK_BPS must be non-negative")
+        max_unhedged = min(
+            bankroll * self._risk_config.max_position_pct,
+            bankroll * self._risk_config.max_portfolio_exposure_pct,
         )
-        _buy_fill_ms = int(time.time() * 1000)
-        sell_result = await self._submit_with_retry(
-            sell_client, sell_leg, signal_id=signal_id, strategy=strategy
-        )
-        _sell_done_ms = int(time.time() * 1000)
-
-        # Flag unbalanced fills so reconciliation/close-out can pick them up.
-        buy_filled = buy_result.filled_price is not None
-        sell_filled = sell_result.filled_price is not None
-        if buy_filled != sell_filled:
-            logger.error(
-                "UNBALANCED_ARB pair=%s buy_filled=%s sell_filled=%s — "
-                "one leg open without hedge. Reconciliation will flag this.",
-                pair_id,
-                buy_filled,
-                sell_filled,
+        extra_cost = max_unhedged * flatten_risk_bps / 10000.0
+        try:
+            buy_fee_rate, sell_fee_rate = await asyncio.gather(
+                self._pretrade_fee_rate(buy_client, buy_leg, buy_platform),
+                self._pretrade_fee_rate(sell_client, sell_leg, sell_platform),
             )
-
-        if self._circuit_breaker is not None:
-            await self._circuit_breaker.record_order_result(
-                success=buy_filled and sell_filled
+            executable = calculate_executable_arb(
+                buy_price=buy_price,
+                sell_price=sell_price,
+                quantity=size,
+                buy_fee_rate=buy_fee_rate,
+                sell_fee_rate=sell_fee_rate,
+                slippage_bps=self._risk_config.slippage_bps,
+                extra_cost=extra_cost,
             )
-
-        if buy_result.filled_price is not None and sell_result.filled_price is not None:
-            actual_spread = sell_result.filled_price - buy_result.filled_price
-            total_fees = (buy_result.fee_paid or 0) + (sell_result.fee_paid or 0)
-            actual_pnl = round(actual_spread * size - total_fees, 4)
-
-            _pnl_cap = size * self._risk_config.pnl_sanity_cap_ratio
-            if actual_pnl > _pnl_cap:
-                logger.warning(
-                    "PNL_SANITY_CAP blocked pair=%s actual_pnl=%.4f > cap=%.4f "
-                    "(size=%.1f spread=%.4f). Likely false-positive pair — skipping DB write.",
+        except (RuntimeError, ValueError) as exc:
+            logger.info("Phase1 fee verification rejected pair=%s: %s", pair_id, exc)
+            return None
+        if (
+            executable is None
+            or not executable.profitable
+            or executable.net_edge_per_contract < min_edge
+        ):
+            return None
+        try:
+            await self.db.execute(
+                """
+                INSERT OR IGNORE INTO market_pairs (
+                    id, market_id_a, market_id_b, pair_type, similarity_score,
+                    match_method, active, verified, created_at, updated_at
+                ) VALUES (?, ?, ?, 'cross_platform', ?, 'inverted_index', 1, 1, ?, ?)
+                """,
+                (
                     pair_id,
-                    actual_pnl,
-                    _pnl_cap,
-                    size,
+                    buy_id,
+                    sell_id,
+                    match.get("similarity", 0.0),
+                    now,
+                    now,
+                ),
+            )
+            await self.db.execute(
+                """
+                INSERT OR IGNORE INTO violations (
+                    id, pair_id, violation_type, price_a_at_detect,
+                    price_b_at_detect, raw_spread, net_spread, fee_estimate_a,
+                    fee_estimate_b, status, detected_at, updated_at
+                ) VALUES (?, ?, 'cross_platform', ?, ?, ?, ?, ?, ?,
+                          'detected', ?, ?)
+                """,
+                (
+                    violation_id,
+                    pair_id,
+                    buy_price,
+                    sell_price,
                     spread,
-                )
-                return None
-
-            pos_id = f"pos_{uuid.uuid4().hex[:12]}"
-            _positions_written = False
-            try:
-                await self.db.execute(
-                    """INSERT INTO positions
-                       (id, signal_id, market_id, strategy, side, book, entry_price,
-                        entry_size, exit_price, exit_size, realized_pnl, fees_paid,
-                        pnl_model, status, opened_at, closed_at, updated_at)
-                       VALUES (?, ?, ?, ?, 'BUY', 'YES', ?, ?, ?, ?, ?, ?, 'realistic', 'closed', ?, ?, ?)""",
-                    # TODO[no-naked-shorts]: when the translated-NO path becomes live
-                    # for arbs, propagate the resolved book here instead of 'YES'.
-                    (
-                        pos_id,
-                        signal_id,
-                        buy_id,
-                        strategy,
-                        buy_result.filled_price,
-                        size,
-                        sell_result.filled_price,
-                        size,
-                        actual_pnl,
-                        total_fees,
-                        now,
-                        now,
-                        now,
-                    ),
-                )
-                _positions_written = True
-            except Exception:
-                logger.exception(
-                    "Failed to insert positions row for pair=%s signal_id=%s pos_id=%s",
-                    pair_id,
-                    signal_id,
-                    pos_id,
-                )
-
-            _outcomes_written = False
-            try:
-                await self.db.execute(
-                    """INSERT INTO trade_outcomes
-                       (id, signal_id, strategy, violation_id, market_id_a, market_id_b,
-                        predicted_edge, predicted_pnl, actual_pnl, fees_total,
-                        edge_captured_pct, signal_to_fill_ms, holding_period_ms,
-                        spread_at_signal, resolved_at, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        f"trade_{uuid.uuid4().hex[:12]}",
-                        signal_id,
-                        strategy,
-                        violation_id,
-                        buy_id,
-                        sell_id,
-                        edge,
-                        round(edge * size, 4),
-                        actual_pnl,
-                        total_fees,
-                        (
-                            round((actual_pnl / (edge * size)) * 100, 1)
-                            if edge * size > 0
-                            else 0
-                        ),
-                        _sell_done_ms - _trade_start_ms,
-                        _sell_done_ms - _buy_fill_ms,
-                        spread,
-                        now,
-                        now,
-                    ),
-                )
-                _outcomes_written = True
-            except Exception:
-                logger.exception(
-                    "Failed to insert trade_outcomes row for pair=%s signal_id=%s",
-                    pair_id,
-                    signal_id,
-                )
-                if _positions_written:
-                    # Roll back the positions row so reconciliation doesn't see
-                    # a closed position with no corresponding trade_outcomes row.
-                    try:
-                        await self.db.rollback()
-                    except Exception:
-                        logger.debug(
-                            "rollback after trade_outcomes failure pair=%s",
-                            pair_id,
-                            exc_info=True,
-                        )
-
-            # Commit per trade: batching delayed persistence by up to 9 trades,
-            # so a process crash between flushes could drop filled positions
-            # that already moved real capital on the exchange. Reconciliation
-            # can't repair what it can't see. SQLite in WAL mode handles
-            # single-row commits cheaply, so the throughput cost is negligible.
-            if _positions_written and _outcomes_written:
-                try:
-                    await self.db.commit()
-                except Exception:
-                    logger.exception(
-                        "Failed to commit positions/trade_outcomes for pair=%s signal_id=%s",
-                        pair_id,
-                        signal_id,
-                    )
-
-            logger.info(
-                "  ARB FILLED: pnl=$%.4f fees=$%.4f | buy@%.4f sell@%.4f",
-                actual_pnl,
-                total_fees,
-                buy_result.filled_price,
-                sell_result.filled_price,
+                    executable.net_edge_per_contract,
+                    executable.buy_fee,
+                    executable.sell_fee,
+                    now,
+                    now,
+                ),
             )
-
-            return {
-                "strategy": strategy,
-                "pair_id": pair_id,
-                "spread": spread,
-                "actual_pnl": actual_pnl,
-                "fees": total_fees,
-            }
-        return None
-
-    async def flush(self):
-        """Commit any pending DB writes.
-
-        No-op under the current per-trade-commit model; retained so callers
-        (trading_session shutdown, tests) can keep their \"drain before exit\"
-        semantics without caring how persistence is scheduled internally.
-        """
-        await self.db.commit()
-
-    def stats(self) -> dict:
-        total_pnl = 0.0
-        total_fees = 0.0
-        for t in self.trades:
-            total_pnl += t.get("actual_pnl", 0)
-            total_fees += t.get("fees", 0)
-        trade_count = len(self.trades)
-        now = time.time()
-        # Mirror the guards from _try_fire_pair() so pairs_eligible_now reflects
-        # how many pairs would actually fire, not just how many have a spread above
-        # the threshold. Pairs in cooldown or with stale prices are excluded.
-        # Note: _is_fresh() is called with the same `now` for both legs so they
-        # are anchored to a single timestamp (matching _try_fire_pair behaviour).
-        eligible = sum(
-            1
-            for m in self._pairs.values()
-            if (p := self.prices.get(m["poly_id"])) is not None
-            and (k := self.prices.get(m["kalshi_id"])) is not None
-            and abs(p - k) >= self.min_spread
-            and self._is_fresh(m["poly_id"], now)
-            and self._is_fresh(m["kalshi_id"], now)
-            and self._is_eligible(f"{m['poly_id']}_{m['kalshi_id']}")
+            await self.db.commit()
+        except Exception:
+            logger.exception("Phase1 opportunity persistence failed; no order sent")
+            return None
+        risk_signal = _RiskSignal(
+            legs=[
+                _RiskLeg(
+                    market_id=buy_id, limit_price=buy_price, size=size, side="BUY"
+                ),
+                _RiskLeg(
+                    market_id=sell_id, limit_price=sell_price, size=size, side="SELL"
+                ),
+            ],
+            edge=executable.net_edge_per_contract,
+            strategy=strategy,
+            violation_id=violation_id,
         )
-        tick_age: dict[str, int] = {}
-        for market_id, ts in self._last_tick_at.items():
-            platform = self._market_platform.get(market_id, "unknown")
-            age_ms = int((now - ts) * 1000)
-            # Keep the freshest (smallest age) tick per platform
-            if platform not in tick_age or tick_age[platform] > age_ms:
-                tick_age[platform] = age_ms
-        muted_count = sum(1 for s in self.fired_state.values() if not s.armed)
+        risk_config = copy.copy(self._risk_config)
+        risk_config.min_edge = min_edge
+        all_passed, checks = await run_all_checks(
+            risk_signal, risk_config, self.db, portfolio_value=bankroll
+        )
+        if not all_passed:
+            failed = [r.check_type for r in checks if not r.passed]
+            await self.db.execute(
+                "UPDATE violations SET status='risk_rejected',"
+                "rejection_reason=?,updated_at=? WHERE id=?",
+                (", ".join(failed), now, violation_id),
+            )
+            await self.db.commit()
+            return None
+
+        # Re-run the equivalence guard immediately before routing orders. Pair
+        # discovery can be stale and market metadata/rules can change between
+        # discovery, depth/fee checks, and execution.
+        equivalent, reason = await verify_contract_equivalence(
+            self.db, match["poly_id"], match["kalshi_id"]
+        )
+        if not equivalent:
+            await self.db.execute(
+                "UPDATE violations SET status='contract_rejected',"
+                "rejection_reason=?,updated_at=? WHERE id=?",
+                (f"trade-time contract guard: {reason}", now, violation_id),
+            )
+            await self.db.commit()
+            return None
+        if await is_halted(self.db):
+            return None
+
+        try:
+            await self.db.execute(
+                """
+                INSERT OR IGNORE INTO signals (
+                    id, violation_id, strategy, signal_type, market_id_a,
+                    market_id_b, target_price_a, target_price_b, model_edge,
+                    kelly_fraction, position_size_a, position_size_b,
+                    total_capital_at_risk, status, fired_at, updated_at
+                ) VALUES (?, ?, ?, 'arb_pair', ?, ?, ?, ?, ?, 0, ?, ?, ?,
+                          'fired', ?, ?)
+                """,
+                (
+                    signal_id,
+                    violation_id,
+                    strategy,
+                    buy_id,
+                    sell_id,
+                    buy_price,
+                    sell_price,
+                    executable.net_edge_per_contract,
+                    size,
+                    size,
+                    size * (buy_price + sell_price),
+                    now,
+                    now,
+                ),
+            )
+            await self.db.commit()
+        except Exception:
+            logger.exception("Phase1 signal persistence failed; no order sent")
+            return None
+        execution = await ArbExecutionEngine(
+            max_unhedged_exposure_usd=max_unhedged,
+            on_halt=lambda reason: halt(self.db, reason),
+            is_halted=lambda: is_halted(self.db),
+        ).execute(
+            buy_client=buy_client,
+            sell_client=sell_client,
+            buy_leg=buy_leg,
+            sell_leg=sell_leg,
+            signal_id=signal_id,
+            strategy=strategy,
+        )
+        if execution.outcome is not ArbOutcome.BOTH_FILLED:
+            await self._record_execution_failure(
+                violation_id, execution.outcome.value, execution.detail
+            )
+            return None
+        buy_result, sell_result = execution.buy_result, execution.sell_result
+        if (
+            not buy_result
+            or not sell_result
+            or buy_result.filled_price is None
+            or sell_result.filled_price is None
+        ):
+            return None
+        buy_fill_price = float(
+            getattr(buy_client, "economic_fill_price", lambda _id, p: p)(
+                buy_result.order_id, buy_result.filled_price
+            )
+        )
+        sell_fill_price = float(
+            getattr(sell_client, "economic_fill_price", lambda _id, p: p)(
+                sell_result.order_id, sell_result.filled_price
+            )
+        )
+        matched_qty = execution.matched_qty
+        actual_fees = (buy_result.fee_paid or 0.0) + (sell_result.fee_paid or 0.0)
+        actual_pnl = round(
+            (sell_fill_price - buy_fill_price) * matched_qty - actual_fees, 6
+        )
+        try:
+            pos_id = f"pos_{uuid.uuid4().hex[:12]}"
+            await self.db.execute(
+                """
+                INSERT INTO positions (
+                    id, signal_id, market_id, strategy, side, book, entry_price,
+                    entry_size, exit_price, exit_size, realized_pnl, fees_paid,
+                    pnl_model, status, opened_at, closed_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'BUY', 'YES', ?, ?, ?, ?, ?, ?,
+                          'realistic', 'closed', ?, ?, ?)
+                """,
+                (
+                    pos_id,
+                    signal_id,
+                    buy_id,
+                    strategy,
+                    buy_fill_price,
+                    matched_qty,
+                    sell_fill_price,
+                    matched_qty,
+                    actual_pnl,
+                    actual_fees,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            await self.db.execute(
+                """
+                INSERT INTO trade_outcomes (
+                    id, signal_id, strategy, violation_id, market_id_a,
+                    market_id_b, predicted_edge, predicted_pnl, actual_pnl,
+                    fees_total, edge_captured_pct, signal_to_fill_ms,
+                    holding_period_ms, spread_at_signal, resolved_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"trade_{uuid.uuid4().hex[:12]}",
+                    signal_id,
+                    strategy,
+                    violation_id,
+                    buy_id,
+                    sell_id,
+                    executable.net_edge_per_contract,
+                    executable.net_profit,
+                    actual_pnl,
+                    actual_fees,
+                    (
+                        (actual_pnl / executable.net_profit) * 100
+                        if executable.net_profit > 0
+                        else 0
+                    ),
+                    execution.latency_ms,
+                    execution.latency_ms,
+                    spread,
+                    now,
+                    now,
+                ),
+            )
+            await self.db.execute(
+                "UPDATE violations SET status='executed',closed_at=?,"
+                "updated_at=? WHERE id=?",
+                (now, now, violation_id),
+            )
+            await self.db.commit()
+        except Exception:
+            await self.db.rollback()
+            logger.exception(
+                "Phase1 financial truth write failed for signal=%s", signal_id
+            )
+            await halt(
+                self.db, f"DB persistence failure after filled arb signal={signal_id}"
+            )
+            return None
+        if self._circuit_breaker is not None:
+            await self._circuit_breaker.record_order_result(success=actual_pnl > 0)
         return {
-            "pairs_monitored": len(self._pairs),
-            "pairs_eligible_now": eligible,
-            "min_spread": self.min_spread,
-            "recently_fired": muted_count,
-            "last_arb_fired_at": self.last_arb_fired_at,
-            "ticks_since_last_fire": self._ticks_since_last_fire,
-            "total_pnl": total_pnl,
-            "total_fees": total_fees,
-            "trade_count": trade_count,
-            "prices_tracked": len(self.prices),
-            "stale_prices_count": sum(
-                1
-                for market_id in self._last_tick_at
-                if not self._is_fresh(market_id, now)
-            ),
-            "ws_last_tick_age_ms_by_platform": tick_age,
-            "skipped_stale": self._skipped_stale,
+            "strategy": strategy,
+            "pair_id": pair_id,
+            "spread": spread,
+            "actual_pnl": actual_pnl,
+            "fees": actual_fees,
+            "requested_size": requested,
+            "matched_size": matched_qty,
+            "theoretical_net_profit": executable.net_profit,
+            "execution_latency_ms": execution.latency_ms,
         }
+
+    @staticmethod
+    async def _pretrade_fee_rate(client, leg, platform):
+        getter = getattr(client, "get_pretrade_fee_rate", None)
+        if getter is not None:
+            return float(await getter(leg))
+        key = "POLYMARKET_FEE_RATE" if platform == "polymarket" else "KALSHI_FEE_RATE"
+        value = os.getenv(key, "").strip()
+        if not value:
+            raise ValueError(f"{key} is not configured for paper fee estimation")
+        try:
+            rate = float(value)
+        except ValueError as exc:
+            raise ValueError(f"{key} must be numeric") from exc
+        if not 0 <= rate <= 1:
+            raise ValueError(f"{key} must be between 0 and 1")
+        return rate
+
+    async def _record_execution_failure(self, violation_id, outcome, detail):
+        try:
+            await self.db.execute(
+                "UPDATE violations SET status=?,rejection_reason=?,updated_at=? WHERE id=?",
+                (
+                    outcome,
+                    detail[:2000],
+                    datetime.now(timezone.utc).isoformat(),
+                    violation_id,
+                ),
+            )
+            await self.db.commit()
+        except Exception:
+            logger.exception("Could not record Phase1 execution outcome")

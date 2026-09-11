@@ -1,18 +1,9 @@
 """
-Internal state reconciliation for the trading system.
+Internal and exchange-state reconciliation for the trading system.
 
-Runs DB-level consistency checks between the `orders`, `positions`, and
-`trade_outcomes` tables and logs any discrepancies to `reconciliation_log`
-so operators can investigate.
-
-Scope is intentionally internal (DB ↔ DB) rather than DB ↔ exchange:
-the exchange API paths already write through BaseExecutionClient, so the
-place drift is most likely to appear is in our own write ordering — e.g.
-an arb where one leg filled and the other didn't (position never written),
-or an order left in `pending` because a crash happened before the update.
-
-Call `reconcile_internal_state(db)` periodically (every N strategy
-cycles). It commits its own writes.
+The exchange reconciliation path is deliberately fail-closed: if an
+exchange cannot provide a trustworthy view, or if an exchange-side order/fill
+cannot be mapped to local state, execution is halted rather than guessed.
 """
 
 import logging
@@ -24,6 +15,261 @@ import aiosqlite
 from core.config import get_config
 
 logger = logging.getLogger(__name__)
+
+
+async def reconcile_exchange_state(
+    db: aiosqlite.Connection,
+    clients: dict[str, object],
+    *,
+    fill_lookback_s: int = 24 * 60 * 60,
+) -> dict[str, int | bool]:
+    """Reconcile local orders against authenticated exchange state.
+
+    ``clients`` is keyed by platform label and each client must implement
+    ``list_open_orders`` and ``list_recent_fills``. A platform failure or an
+    unexplained remote order/fill immediately persists a halt.
+
+    We also re-query every locally pending order. This closes the crash window
+    where an order was accepted by the exchange but the process died before
+    the local fill update was committed.
+    """
+    summary: dict[str, int | bool] = {
+        "platforms_checked": 0,
+        "open_orders_checked": 0,
+        "fills_checked": 0,
+        "pending_orders_checked": 0,
+        "local_pending_recovered": 0,
+        "unknown_remote_orders": 0,
+        "unknown_remote_fills": 0,
+        "exchange_errors": 0,
+        "clean": True,
+    }
+
+    cutoff = int(time.time()) - fill_lookback_s
+    try:
+        cursor = await db.execute(
+            """
+            SELECT id, platform, submitted_at, status
+            FROM orders
+            WHERE status = 'pending'
+              AND submitted_at IS NOT NULL
+              AND submitted_at != ''
+            """
+        )
+        pending_rows = await cursor.fetchall()
+    except Exception as exc:
+        await _halt_exchange(db, f"exchange reconciliation DB read failed: {exc}")
+        summary["exchange_errors"] = 1
+        summary["clean"] = False
+        return summary
+
+    for platform, client in clients.items():
+        summary["platforms_checked"] += 1
+        try:
+            open_orders = await client.list_open_orders()
+            fills = await client.list_recent_fills(cutoff)
+        except NotImplementedError as exc:
+            await _halt_exchange(
+                db, f"{platform} exchange reconciliation unsupported: {exc}"
+            )
+            summary["exchange_errors"] += 1
+            summary["clean"] = False
+            continue
+        except Exception as exc:
+            logger.exception("Exchange reconciliation failed for %s", platform)
+            await _halt_exchange(db, f"{platform} exchange reconciliation failed: {exc}")
+            summary["exchange_errors"] += 1
+            summary["clean"] = False
+            continue
+
+        open_ids = {
+            str(_remote_order_id(order))
+            for order in open_orders
+            if _remote_order_id(order)
+        }
+        summary["open_orders_checked"] += len(open_ids)
+        fill_order_ids = {
+            str(_remote_fill_order_id(fill))
+            for fill in fills
+            if _remote_fill_order_id(fill)
+        }
+        summary["fills_checked"] += len(fills)
+
+        try:
+            cursor = await db.execute(
+                """
+                SELECT id, status, submitted_at
+                FROM orders
+                WHERE platform = ?
+                """,
+                (platform,),
+            )
+            local_rows = await cursor.fetchall()
+        except Exception as exc:
+            await _halt_exchange(db, f"{platform} local order query failed: {exc}")
+            summary["exchange_errors"] += 1
+            summary["clean"] = False
+            continue
+
+        local_ids = {str(row[0]) for row in local_rows if row[0]}
+        local_pending_ids = {
+            str(row[0]) for row in local_rows if row[0] and row[1] == "pending"
+        }
+
+        unknown_orders = open_ids - local_ids
+        if unknown_orders:
+            summary["unknown_remote_orders"] += len(unknown_orders)
+            summary["clean"] = False
+            await _halt_exchange(
+                db,
+                f"{platform} has remote open orders absent from local DB: "
+                + ", ".join(sorted(unknown_orders)[:20]),
+            )
+
+        unknown_fills = fill_order_ids - local_ids
+        if unknown_fills:
+            summary["unknown_remote_fills"] += len(unknown_fills)
+            summary["clean"] = False
+            await _halt_exchange(
+                db,
+                f"{platform} has remote fills absent from local DB: "
+                + ", ".join(sorted(unknown_fills)[:20]),
+            )
+
+        # A pending local order is not allowed to remain ambiguous. If it is
+        # absent from the open set, ask the exchange for its terminal state.
+        for order_id in local_pending_ids:
+            summary["pending_orders_checked"] += 1
+            if order_id in open_ids:
+                continue
+            try:
+                remote = await client.get_order_status(order_id)
+            except Exception as exc:
+                await _halt_exchange(
+                    db, f"{platform} status lookup failed for {order_id}: {exc}"
+                )
+                summary["exchange_errors"] += 1
+                summary["clean"] = False
+                continue
+            if not remote:
+                await _halt_exchange(
+                    db,
+                    f"{platform} local pending order {order_id} is absent from "
+                    "open orders and cannot be retrieved",
+                )
+                summary["exchange_errors"] += 1
+                summary["clean"] = False
+                continue
+            if await _reconcile_terminal_order(db, platform, order_id, remote):
+                summary["local_pending_recovered"] += 1
+
+    # If any pending rows exist on a platform for which no client was supplied,
+    # the caller has not established complete exchange coverage.
+    pending_platforms = {str(row[1]) for row in pending_rows if row[1]}
+    missing_clients = pending_platforms - set(clients)
+    if missing_clients:
+        await _halt_exchange(
+            db,
+            "pending orders have no exchange reconciliation client: "
+            + ", ".join(sorted(missing_clients)),
+        )
+        summary["exchange_errors"] += len(missing_clients)
+        summary["clean"] = False
+
+    return summary
+
+
+async def _reconcile_terminal_order(
+    db: aiosqlite.Connection,
+    platform: str,
+    order_id: str,
+    remote: dict,
+) -> bool:
+    """Persist a terminal remote fill when the local DB missed the update."""
+    status = str(remote.get("status", "")).lower()
+    matched = _number(
+        remote.get("size_matched")
+        if platform == "polymarket"
+        else remote.get("fill_count_fp", remote.get("fill_count", 0))
+    )
+    terminal = status in {
+        "matched",
+        "unmatched",
+        "executed",
+        "filled",
+        "canceled",
+        "cancelled",
+    }
+    if not terminal:
+        return False
+    if matched <= 0:
+        await db.execute(
+            "UPDATE orders SET status = 'failed', updated_at = ? WHERE id = ?",
+            (int(time.time()), order_id),
+        )
+        await db.commit()
+        return True
+
+    if platform == "polymarket":
+        price = _number(remote.get("price"))
+        fee = None
+        fee_verified = 0
+    else:
+        price = _number(remote.get("yes_price_dollars"))
+        fee = _number(remote.get("taker_fees_dollars", 0)) + _number(
+            remote.get("maker_fees_dollars", 0)
+        )
+        fee_verified = 1
+
+    local_requested = await db.execute_fetchone(
+        "SELECT requested_size FROM orders WHERE id = ?", (order_id,)
+    )
+    requested = _number(local_requested[0]) if local_requested else 0.0
+    new_status = "filled" if matched >= requested else "partially_filled"
+    await db.execute(
+        """
+        UPDATE orders SET
+            filled_price = ?, filled_size = ?, fee_paid = ?, fee_verified = ?,
+            status = ?, filled_at = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            price,
+            matched,
+            fee,
+            fee_verified,
+            new_status,
+            int(time.time()),
+            int(time.time()),
+            order_id,
+        ),
+    )
+    await db.commit()
+    return True
+
+
+def _remote_order_id(order: dict):
+    return order.get("order_id") or order.get("orderID") or order.get("id")
+
+
+def _remote_fill_order_id(fill: dict):
+    return fill.get("order_id") or fill.get("orderID") or fill.get("orderId")
+
+
+def _number(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def _halt_exchange(db: aiosqlite.Connection, reason: str) -> None:
+    from core.engine.execution_control import halt
+
+    try:
+        await halt(db, reason)
+    except Exception:
+        logger.exception("Failed to persist exchange reconciliation halt")
 
 
 async def reconcile_internal_state(db: aiosqlite.Connection) -> dict[str, int]:
@@ -151,8 +397,6 @@ async def _check_stuck_pending_orders(db: aiosqlite.Connection) -> int:
             age_s = int(time.time()) - int(submitted_at)
         except (TypeError, ValueError):
             age_s = -1
-        # detail is the stable per-order key used for _is_recently_logged dedup
-        # (must not include age_s which changes each cycle).
         detail = f"order_id={order_id}"
         action_taken = (
             f"order_id={order_id} signal_id={signal_id} "
@@ -176,26 +420,7 @@ async def _check_stuck_pending_orders(db: aiosqlite.Connection) -> int:
 
 
 async def _check_unbalanced_arb_pairs(db: aiosqlite.Connection) -> int:
-    """Arb signals where only one leg filled but no position was written.
-
-    Arb trades write two orders under the same signal_id. When both fill,
-    arb_engine writes a positions row. If exactly one order filled (or
-    partially_filled) and no position exists for that signal, one leg is
-    exposed on-exchange without a hedge — that's the case the in-process
-    UNBALANCED_ARB log in arb_engine warns about, and we record it here
-    so it persists past the log ring buffer.
-
-    The scan is bounded to the last 30 days via submitted_at to prevent a
-    full-table scan of orders as the DB grows. submitted_at is stored as a
-    10-digit decimal epoch string; text comparison of equal-length decimal
-    strings is lexicographically equivalent to numeric comparison, so the
-    index on submitted_at (idx_orders_submitted_at) is used here. Arbs
-    older than 30 days have already been logged by _is_recently_logged
-    (1-hour dedup window) many times; the 30-day boundary is acceptable.
-    Note: a signal straddling the boundary (one leg older than 30 days,
-    one newer) will not appear in the subquery's HAVING COUNT(*) >= 2 and
-    will therefore be invisible — this is an accepted trade-off.
-    """
+    """Arb signals where only one leg filled but no position was written."""
     cutoff_30d_str = str(int(time.time()) - 30 * 86400)
     cursor = await db.execute(
         """
@@ -252,12 +477,7 @@ async def _is_recently_logged(
     detail: str,
     window_s: int = 3600,
 ) -> bool:
-    """Return True if a reconciliation_log row with the same check_type and
-    detail string was already inserted within the last *window_s* seconds.
-
-    This prevents the same orphaned/stuck/unbalanced discrepancy from being
-    logged on every reconciliation cycle when reconcile_every is small.
-    """
+    """Return True if the same discrepancy was recently logged."""
     cutoff = (datetime.now(timezone.utc) - timedelta(seconds=window_s)).isoformat()
     cursor = await db.execute(
         "SELECT COUNT(*) FROM reconciliation_log "
@@ -310,17 +530,7 @@ async def _log_discrepancy(
 
 
 async def _check_signals_without_orders(db: aiosqlite.Connection) -> int:
-    """Signals that were fired but generated no orders.
-
-    A signal with a ``fired_at`` timestamp that is older than 60 seconds
-    and has no rows in the ``orders`` table under the same ``id`` (signal_id)
-    indicates that order submission silently failed — either due to a
-    pre-submission exception in _execute_arb_trade or a DB write failure.
-
-    The 60-second age guard prevents false positives from in-flight signals
-    whose order rows haven't been written yet. Bounded to the last 30 days
-    to avoid a full-table scan as the signals table grows.
-    """
+    """Signals that were fired but generated no orders."""
     cutoff_30d = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
     grace_period = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
     cursor = await db.execute(
@@ -354,15 +564,7 @@ async def _check_signals_without_orders(db: aiosqlite.Connection) -> int:
 
 
 async def _check_closed_without_outcomes(db: aiosqlite.Connection) -> int:
-    """Closed positions with no corresponding trade_outcomes row.
-
-    A position that closes cleanly should always produce a trade_outcomes row.
-    A closed position without one indicates a write ordering failure that
-    silently corrupts PnL accounting and strategy performance metrics.
-
-    Bounded to the last 30 days via updated_at to avoid false positives from
-    legacy positions written before this relationship was enforced.
-    """
+    """Closed positions with no corresponding trade_outcomes row."""
     cutoff_30d = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
     cursor = await db.execute(
         """

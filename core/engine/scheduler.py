@@ -1,103 +1,50 @@
-"""
-Scheduled strategy runner.
+"""Phase 1 strategy scheduler.
 
-Provides ScheduledStrategyRunner which runs non-latency-sensitive strategies
-(calibration bias, liquidity patterns, etc.) on a fixed timer interval.
+P2-P5 directional/single-platform strategies are intentionally disabled while
+Phase 1 cross-platform arbitrage is being validated. Resolution, mark-to-market
+cleanup, reconciliation and invariant checks remain enabled.
 """
+
+from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 
-import aiosqlite
-
-from core.config import RiskControlConfig
+from core.engine.scheduler_legacy import (
+    ScheduledStrategyRunner as _LegacyScheduledStrategyRunner,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class ScheduledStrategyRunner:
-    """Runs non-latency-sensitive strategies on a fixed interval.
-
-    These strategies don't depend on capturing a fleeting spread —
-    they analyze calibration bias, liquidity patterns, mean reversion, etc.
-    Running every 60-300s is fine.
-    """
-
-    def __init__(
-        self,
-        db: aiosqlite.Connection,
-        interval: int = 120,
-        max_trades_per_cycle: int = 20,
-        risk_config: "RiskControlConfig | None" = None,
-        circuit_breaker=None,
-        execution_mode: str | None = None,
-        alert_manager=None,
-        price_cache: "dict | None" = None,
-    ):
-        self.db = db
-        self.interval = interval
-        self.max_trades = max_trades_per_cycle
-        self.total_trades = 0
-        # Live price cache shared with the websocket feed — gives P2-P5
-        # strategies real-time prices without reading stale DB rows.
-        self._price_cache = price_cache
-        # Phase 2: risk config and circuit breaker.
-        # Phase 6: when execution_mode is provided and risk_config is not, use
-        # get_effective_risk_config so live mode automatically enforces tighter limits.
-        if risk_config is not None:
-            self._risk_config: RiskControlConfig = risk_config
-        elif execution_mode is not None:
-            from core.live_gate import get_effective_risk_config
-
-            self._risk_config = get_effective_risk_config(execution_mode)
-        else:
-            self._risk_config = RiskControlConfig()
-        self._circuit_breaker = circuit_breaker
-        # Phase 7: alert_manager forwards invariant violations to Discord.
-        self._alert_manager = alert_manager
-        # Reconciliation runs every N cycles to catch DB-level state drift
-        # (orphaned positions, stuck pending orders, unbalanced arb legs).
-        self._cycle_count = 0
-        self._reconcile_every = self._risk_config.reconcile_every
+class ScheduledStrategyRunner(_LegacyScheduledStrategyRunner):
+    """Run maintenance only; do not activate P2-P5 during Phase 1."""
 
     async def run_one_cycle(self) -> list:
-        """Execute a single strategy cycle. Returns list of opened positions.
-
-        Circuit breaker check happens first — if halted, returns [] immediately.
-        After opening new positions, closes any that have exceeded holding_period_s
-        (Phase 4 realistic fill model).
-        Extracted from run() so it can be called and tested independently.
-        """
-        from core.strategies.single_platform import (
-            detect_single_platform_opportunities,
-            mark_and_close_positions,
-        )
-
         if (
             self._circuit_breaker is not None
             and await self._circuit_breaker.should_halt()
         ):
-            logger.warning("CIRCUIT_BREAKER halted — skipping scheduled strategy cycle")
+            logger.warning("CIRCUIT_BREAKER halted — skipping scheduled maintenance")
             return []
-        # Resolution pass: close positions for markets that have settled.
-        # Runs before mark_and_close so resolved markets close at their
-        # settlement price rather than at a stale tape price.
         try:
             from core.engine.resolution import close_resolved_positions
 
             await close_resolved_positions(self.db)
         except Exception:
             logger.exception("resolution pass failed")
-        # Mark-to-market pass: close expired open positions at current prices
-        await mark_and_close_positions(
-            self.db,
-            holding_period_s=self._risk_config.strategy_holding_period_s,
-            price_cache=self._price_cache,
-        )
-        # Reconciliation: every N cycles, check DB-level state consistency.
-        # Catches orphaned positions, stuck pending orders, and unbalanced
-        # arb legs — writes discrepancies to reconciliation_log.
+        try:
+            from core.strategies.single_platform import mark_and_close_positions
+
+            await mark_and_close_positions(
+                self.db,
+                holding_period_s=self._risk_config.strategy_holding_period_s,
+                price_cache=self._price_cache,
+            )
+        except Exception:
+            logger.exception("mark-to-market maintenance failed")
         self._cycle_count += 1
         if self._cycle_count % self._reconcile_every == 0:
             try:
@@ -106,47 +53,35 @@ class ScheduledStrategyRunner:
                 await reconcile_internal_state(self.db)
             except Exception:
                 logger.exception("reconciliation pass failed")
-        # Phase 7: run invariant checks before opening new positions.
-        # alert_manager forwards violations to Discord when configured.
-        from core.invariants import check_all_invariants
+        try:
+            from core.invariants import check_all_invariants
 
-        await check_all_invariants(
-            self.db, mode="warn", alert_manager=self._alert_manager
-        )
-        return await detect_single_platform_opportunities(
-            self.db,
-            max_trades=self.max_trades,
-            risk_config=self._risk_config,
-            price_cache=self._price_cache,
-            circuit_breaker=self._circuit_breaker,
-        )
+            await check_all_invariants(
+                self.db, mode="warn", alert_manager=self._alert_manager
+            )
+        except Exception:
+            logger.exception("invariant check failed")
+        if os.getenv("PHASE1_ONLY", "true").lower() == "true":
+            return []
+        # Explicit operator opt-in is required to ever run the legacy P2-P5
+        # path after Phase 1 validation.
+        return await super().run_one_cycle()
 
     async def run(self, stop_event: asyncio.Event):
-        """Run strategy cycles until stop_event is set."""
-        logger.info(
-            "ScheduledStrategyRunner started: interval=%ds, max_trades=%d",
-            self.interval,
-            self.max_trades,
-        )
+        logger.info("Phase 1 scheduler started: P2-P5 disabled")
         while not stop_event.is_set():
             try:
                 t0 = time.time()
                 trades = await self.run_one_cycle()
                 self.total_trades += len(trades)
-                elapsed = time.time() - t0
                 logger.info(
-                    "Scheduled strategies: %d trades in %.1fs (total: %d)",
+                    "Phase 1 maintenance: %d trades in %.1fs",
                     len(trades),
-                    elapsed,
-                    self.total_trades,
+                    time.time() - t0,
                 )
-            except Exception as e:
-                logger.error("Scheduled strategy error: %s", e)
-
-            # Wait for interval or stop
+            except Exception:
+                logger.exception("Phase 1 scheduler cycle failed")
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=self.interval)
-                logger.info("ScheduledStrategyRunner stopped gracefully")
-                break  # stop_event was set
             except asyncio.TimeoutError:
-                pass  # interval elapsed, run again
+                pass

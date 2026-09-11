@@ -1,7 +1,7 @@
 """
 Base execution client with shared DB write logic.
 
-All execution clients (mock, kalshi, polymarket, paper) write to the same
+All execution clients (mock, paper, kalshi, polymarket) write to the same
 DB tables in the same format. This base class enforces that contract.
 """
 
@@ -30,6 +30,7 @@ class OrderResult:
     filled_price: float | None = None
     filled_size: float | None = None
     fee_paid: float | None = None
+    fee_verified: bool = True
     slippage: float | None = None
     error_message: str | None = None
 
@@ -64,14 +65,34 @@ class BaseExecutionClient:
         """Get order status. Subclasses must implement."""
         raise NotImplementedError
 
+    async def list_open_orders(self) -> list[dict]:
+        """Return all exchange-side open orders for reconciliation.
+
+        Live clients must override this. Returning an empty list by default
+        would be unsafe because it could make an unavailable exchange look
+        clean, so the default is deliberately unsupported.
+        """
+        raise NotImplementedError
+
+    async def list_recent_fills(self, since: int | None = None) -> list[dict]:
+        """Return exchange-side fills for reconciliation.
+
+        ``since`` is an optional Unix epoch hint. Implementations may return
+        a wider window because the exchange pagination model may not map
+        directly to timestamps.
+        """
+        raise NotImplementedError
+
+    async def get_exchange_positions(self) -> list[dict]:
+        """Return exchange-side positions for reconciliation."""
+        raise NotImplementedError
+
     async def get_balance(self) -> float | None:
         """Get account balance. Subclasses must implement."""
         raise NotImplementedError
 
     async def close(self) -> None:
         """Clean up resources. Override if needed."""
-
-    # ── Shared DB writes ────────────────────────────────────────────────────────────────────
 
     async def write_order(
         self,
@@ -81,23 +102,13 @@ class BaseExecutionClient:
         strategy: str | None = None,
         resolved: "ResolvedOrder | None" = None,
     ) -> None:
-        """
-        Write an order record to the orders table.
-
-        When ``resolved`` is provided, ``side``, ``requested_price``, and
-        ``book`` are pulled from it — reflecting what actually hit the
-        exchange rather than the strategy's original intent. Callers that
-        don't route through a resolver (Kalshi, paper-Kalshi) pass None
-        and rows get book='YES' via the column default.
-        """
+        """Write an order record; DB failure is fatal to the execution path."""
         now = int(time.time())
-        requested_price: float | None
         if resolved is not None:
             side_str = resolved.side.value
             requested_price = resolved.limit_price
             book_str = resolved.book.value
         else:
-            # Normalize to uppercase for consistency with new enum-typed writers.
             side_str = (
                 leg.side.value if hasattr(leg.side, "value") else str(leg.side).upper()
             )
@@ -112,7 +123,7 @@ class BaseExecutionClient:
                     market_id, side, order_type,
                     requested_price, requested_size,
                     filled_price, filled_size, slippage, fee_paid,
-                    status, failure_reason,
+                    fee_verified, status, failure_reason,
                     retry_count, submitted_at,
                     filled_at, submission_latency_ms, fill_latency_ms,
                     strategy, updated_at, book
@@ -121,7 +132,7 @@ class BaseExecutionClient:
                     ?, ?, ?,
                     ?, ?,
                     ?, ?, ?, ?,
-                    ?, ?,
+                    ?, ?, ?,
                     0, ?,
                     ?, ?, ?,
                     ?, ?, ?
@@ -145,6 +156,7 @@ class BaseExecutionClient:
                     result.filled_size,
                     result.slippage,
                     result.fee_paid,
+                    int(result.fee_verified),
                     result.status,
                     result.error_message,
                     now,
@@ -156,12 +168,12 @@ class BaseExecutionClient:
                     book_str,
                 ),
             )
-            # Note: caller is responsible for committing in batches
         except Exception:
-            logger.exception("Failed to write order to DB")
+            logger.exception("Failed to write order %s", result.order_id)
+            raise
 
     async def write_fill_event(self, result: OrderResult, detail: str = "") -> None:
-        """Write a fill event to order_events."""
+        """Write a fill event; DB failure is fatal to reconciliation."""
         if result.filled_price is None:
             return
 
@@ -183,12 +195,12 @@ class BaseExecutionClient:
                     now,
                 ),
             )
-            # Note: caller is responsible for committing in batches
         except Exception:
-            logger.exception("Failed to write fill event to DB")
+            logger.exception("Failed to write fill event %s", result.order_id)
+            raise
 
     async def update_order_fill(self, result: OrderResult) -> None:
-        """Update an existing pending order with fill data (for live polling)."""
+        """Update an existing pending order with fill data."""
         now = int(time.time())
         try:
             await self.db.execute(
@@ -198,6 +210,7 @@ class BaseExecutionClient:
                     filled_size = ?,
                     slippage = ?,
                     fee_paid = ?,
+                    fee_verified = ?,
                     fill_latency_ms = ?,
                     filled_at = ?,
                     status = ?,
@@ -209,6 +222,7 @@ class BaseExecutionClient:
                     result.filled_size,
                     result.slippage,
                     result.fee_paid,
+                    int(result.fee_verified),
                     result.fill_latency_ms,
                     now,
                     result.status,
@@ -218,4 +232,5 @@ class BaseExecutionClient:
             )
             await self.db.commit()
         except Exception:
-            logger.exception("Failed to update order fill")
+            logger.exception("Failed to update order fill %s", result.order_id)
+            raise
