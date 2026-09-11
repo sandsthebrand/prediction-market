@@ -24,7 +24,7 @@ class Phase1PaperExecutionClient(PaperExecutionClient):
         if leg.platform == "polymarket":
             market_id = leg.market_id
             host = os.getenv(
-                "POLYMARKET_API_BASE", "https://clob.polymarket.com"
+                "POLYMARKET_CLOB_API_BASE", "https://clob.polymarket.com"
             ).rstrip("/")
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.get(f"{host}/clob-markets/{market_id}")
@@ -96,7 +96,7 @@ class Phase1PaperExecutionClient(PaperExecutionClient):
             if resolved is None:
                 return None
             host = os.getenv(
-                "POLYMARKET_API_BASE", "https://clob.polymarket.com"
+                "POLYMARKET_CLOB_API_BASE", "https://clob.polymarket.com"
             ).rstrip("/")
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.get(
