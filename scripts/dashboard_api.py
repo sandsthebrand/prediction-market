@@ -31,6 +31,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from core.config import get_config
+from core.secrets import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +121,7 @@ def _build_app(
 
     # HTTP Basic Auth — enabled when DASHBOARD_PASSWORD env var is set.
     # Add before CORS so unauthenticated requests are rejected at the gate.
-    _dash_password = os.getenv("DASHBOARD_PASSWORD", "")
+    _dash_password = get_secret("DASHBOARD_PASSWORD", "") or ""
     if _dash_password:
         _dash_user = os.getenv("DASHBOARD_USER", "admin")
         app.add_middleware(
@@ -1213,9 +1214,8 @@ def _build_app(
                             runtime_updated = runtime_updated.replace(
                                 tzinfo=timezone.utc
                             )
-                        runtime_age_s = int(
-                            (datetime.now(timezone.utc) - runtime_updated).total_seconds()
-                        )
+                        runtime_age = datetime.now(timezone.utc) - runtime_updated
+                        runtime_age_s = int(runtime_age.total_seconds())
                         result["runtime_age_s"] = runtime_age_s
                         if runtime_age_s > 90:
                             issues.append(f"runtime_heartbeat_stale:{runtime_age_s}s")

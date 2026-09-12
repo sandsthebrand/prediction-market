@@ -18,8 +18,24 @@ import pytest
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.config import RiskControlConfig
-from core.engine import ArbitrageEngine, ScheduledStrategyRunner
+from core.config import RiskControlConfig  # noqa: E402
+from core.engine import ArbitrageEngine, ScheduledStrategyRunner  # noqa: E402
+from execution.clients.paper import PaperExecutionClient  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _disable_live_price_fetches_for_engine_tests(monkeypatch):
+    """Keep engine tests hermetic by using their seeded database prices.
+
+    PaperExecutionClient normally tries an exchange lookup before its database
+    fallback. These tests seed the fallback explicitly, so reaching an exchange
+    adds network-dependent delays without exercising engine behavior.
+    """
+
+    async def _no_live_price(self, platform: str, platform_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(PaperExecutionClient, "_fetch_live_price", _no_live_price)
 
 
 def _make_match(poly_id, kalshi_id, poly_price, kalshi_price, similarity=0.85):

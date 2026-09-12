@@ -21,6 +21,16 @@ cp config.env.example config.env
 
 Edit `deploy/config.env` and set a unique `PROJECT_ID` (e.g. `predictor-trading-2025`). Leave everything else as-is unless you have a preference on region.
 
+### Secrets prerequisite
+
+The production services use GCP Secret Manager in strict mode and will not
+fall back to plaintext environment variables. Before deploying, an authorized
+administrator must create the required exchange and alert secrets, grant the
+VM service account access, and securely provision the Kalshi PEM at the
+configured path with mode `0600`. The deployment workflow transfers only
+non-secret runtime configuration. It does not create, rotate, inspect, or
+copy secret values.
+
 ---
 
 ## Step 2: Provision GCP resources
