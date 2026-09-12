@@ -424,6 +424,8 @@ async def main():
             starting_capital=risk_config.starting_capital,
             max_daily_loss_pct=risk_config.max_daily_loss_pct,
             consecutive_failure_limit=risk_config.consecutive_failure_limit,
+            execution_failure_alert_count=risk_config.execution_failure_alert_count,
+            execution_failure_alert_window_s=risk_config.execution_failure_alert_window_s,
         )
         await circuit_breaker.load_state()
 

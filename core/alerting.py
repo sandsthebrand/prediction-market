@@ -50,6 +50,20 @@ from core.secrets import get_secret
 logger = logging.getLogger(__name__)
 
 
+def notify_database_failure(component: str, error: BaseException) -> None:
+    """Send a sanitized critical alert for a material database failure."""
+    error_class = type(error).__name__
+    get_alert_manager().send_nowait(
+        # The class is useful operational context and makes distinct database
+        # incidents independently alertable. Never include error text here:
+        # database exceptions can contain SQL, bound values, or credentials.
+        title=f"Database operation failed: {component} ({error_class})",
+        message=f"Material database operation failed in {component}",
+        severity=Severity.CRITICAL,
+        component=component,
+    )
+
+
 class Severity(str, Enum):
     INFO = "info"
     WARNING = "warning"
