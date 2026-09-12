@@ -94,6 +94,16 @@ Type-check:
 mypy core/ execution/ scripts/
 ```
 
+### Paper-mode soak checks
+
+Keep `EXECUTION_MODE=paper`; paper clients simulate fills and do not submit
+exchange orders. Run the session with `--dashboard`, then inspect
+`/api/system-health` periodically. During a healthy soak the runtime section
+should show a fresh heartbeat (under 90 seconds), recent ticks for both
+platforms (under 60 seconds), and stable `process_rss_bytes` and
+`database_bytes` growth. The endpoint returns `warn` if its runtime heartbeat
+or either websocket feed is stale.
+
 ## Trading Strategies
 
 One real strategy (P1) plus four spread-bucket labels (P2–P5) applied to same-platform signals for PnL attribution. P2–P5 are not distinct algorithms — they flow through the same execution path; the label is chosen by spread magnitude and pair type (see `core/strategies/assignment.py`).
